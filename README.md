@@ -50,14 +50,11 @@ git clone https://github.com/tobkim/pangolin-ip-rule-manager.git
 cd pangolin-ip-rule-manager
 ```
 
-2) Configure docker-compose.yml
-- Open docker-compose.yml in your editor.
-- Update the following values under services.pangolin-ip-rule-manager.environment:
+2) Copy config.env.sample to config.env and update the values.
   - PANGOLIN_URL: Your Pangolin API base URL
   - ORG_ID: Your Pangolin organization ID (string)
   - PANGOLIN_TOKEN: API token with the required permissions
   - RESOURCE_IDS: Comma-separated list of resource IDs to manage (e.g., 2,7,12). The available resource ids are listed in the logs at the start of the container.
-- Alternatively, create a config.env next to docker-compose.yml and put sensitive overrides there (e.g., PANGOLIN_TOKEN, RESOURCE_IDS, ORG_ID). The compose file already references env_file: ./config.env.
 
 3) Start the service
 

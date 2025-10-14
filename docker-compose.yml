@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   pangolin-ip-rule-manager:
     # Build the image from the local Dockerfile (recommended for local use)
@@ -33,6 +31,9 @@ services:
       STATE_FILE: /data/state.json   # store state inside a dedicated data volume
       RULE_PRIORITY: "0"
 
+    networks:
+      - pangolin # put in pangolin network
+
     # Persist only the state file. The application code stays inside the image.
     volumes:
       - pangolin-ip-rule-manager-data:/data
@@ -41,3 +42,7 @@ services:
 
 volumes:
   pangolin-ip-rule-manager-data: {}
+
+networks:
+  pangolin:
+    external: true
