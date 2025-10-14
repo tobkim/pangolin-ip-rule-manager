@@ -12,20 +12,6 @@ Tested with Pangolin v1.10.3.
 
 ---
 
-## Table of Contents
-- Overview
-- Key Properties
-- Configuration
-- Run with Docker Compose (recommended)
-- Run Locally (Docker)
-- Behavior
-- Notes
-- API Key permissions (with screenshot)
-- License
-- Integrating via CSS (e.g., Jellyfin)
-
----
-
 ## Overview
 This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 transparent PNG. Each request is treated as a heartbeat from the client's IP address, prompting rule creation (if needed) in Pangolin for configured resources. A background task cleans up rules created by this service if the IP hasn't been seen for a configurable period.
 
