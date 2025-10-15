@@ -273,12 +273,6 @@ class BannerHandler(BaseHTTPRequestHandler):
 
         # Optional: enforce Pangolin security header if configured
         if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
-            # If only one is configured, consider it misconfigured and reject all requests
-            if not (EXPECTED_PANGOLIN_HEADER_KEY and EXPECTED_PANGOLIN_HEADER_VALUE):
-                self.send_response(403)
-                self.end_headers()
-                self.wfile.write(b"Forbidden: security header misconfigured; both key and value must be configured")
-                return
             actual = self.headers.get(EXPECTED_PANGOLIN_HEADER_KEY)
             if actual is None or actual != EXPECTED_PANGOLIN_HEADER_VALUE:
                 self.send_response(403)
