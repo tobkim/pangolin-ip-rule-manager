@@ -346,7 +346,9 @@ def main():
     print_org_resources()
     if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
         print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are set. The service will enforce these headers from pangolin.")
-        
+    else:
+        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are not set. The service will not enforce any additional security headers.")
+
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
     t.start()
