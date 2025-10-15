@@ -276,6 +276,7 @@ class BannerHandler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.end_headers()
             self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
+            print(f"[error] Missing or invalid Pangolin custom header: {actual}")
             return
 
         parsed = urlparse(self.path)
@@ -283,6 +284,7 @@ class BannerHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found")
+            print(f"[error] Invalid path: {self.path}")
             return
 
         # Update state and ensure rules
