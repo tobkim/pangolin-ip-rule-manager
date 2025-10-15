@@ -1,6 +1,6 @@
 # Pangolin IP Rule Manager
 
-> A tiny Dockerized web server that serves a single file (banner.png) and, on each request, ensures the requester's IP has an ACCEPT rule in Pangolin VPN across configured resources. It persists a small hashmap of seen IPs and periodically deletes rules created by this service if the IP has not been seen for a configurable number of minutes.
+A tiny Dockerized web server that serves a single file and, for each request to it, puts the requester's IP in an ACCEPT rule in Pangolin VPN across configured resources, e.g. to 'unlock' Jellyfin on a Smart TV or other apps that need full access to a resource. It persists a small hashmap of seen IPs and periodically deletes rules created by this service if the IP has not been seen for a configurable number of minutes.
 
 Tested with Pangolin v1.10.3.
 
