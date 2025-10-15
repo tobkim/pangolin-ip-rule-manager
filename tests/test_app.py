@@ -116,7 +116,7 @@ def test_security_header_enforced(monkeypatch, temp_state_file):
         _ = resp.read()
         assert resp.status == 403
 
-        # With correct security header -> 200
+        # With correct custom header -> 200
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {"Remote-User": "bob", "X-Test-Key": "v123"}
         conn.request("GET", "/banner.png", headers=headers)
@@ -170,7 +170,7 @@ def test_cleanup_once_removes_expired_ips(monkeypatch, app_module):
     # Do not perform real HTTP calls for deletion; pretend success
     monkeypatch.setattr(app, "delete_ip_rule_if_created_by_us", lambda ip, rid: True)
 
-    app.cleanup_once()
+    app.cleanup_old_ips()
 
     with app.state_lock:
         assert old_ip not in app.state
@@ -293,7 +293,7 @@ def test_security_header_enforced(monkeypatch, temp_state_file):
         _ = resp.read()
         assert resp.status == 403
 
-        # With correct security header -> 200
+        # With correct custom header -> 200
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {"Remote-User": "bob", "X-Test-Key": "v123"}
         conn.request("GET", "/banner.png", headers=headers)
@@ -347,7 +347,7 @@ def test_cleanup_once_removes_expired_ips(monkeypatch, app_module):
     # Do not perform real HTTP calls for deletion; pretend success
     monkeypatch.setattr(app, "delete_ip_rule_if_created_by_us", lambda ip, rid: True)
 
-    app.cleanup_once()
+    app.cleanup_old_ips()
 
     with app.state_lock:
         assert old_ip not in app.state

@@ -192,7 +192,7 @@ def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
         return False
 
 
-def cleanup_once():
+def cleanup_old_ips():
     print("[cleanup] starting")
     print("current ips allowed:" , str(state))
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=RETENTION_MINUTES)
@@ -237,7 +237,7 @@ def cleanup_once():
 def cleanup_loop():
     while True:
         try:
-            cleanup_once()
+            cleanup_old_ips()
         except Exception as e:
             print(f"[cleanup] unexpected error: {e}")
         time.sleep(CLEANUP_INTERVAL_MINUTES*60)
@@ -271,13 +271,13 @@ class BannerHandler(BaseHTTPRequestHandler):
         # Log all request headers
         print("[headers]", json.dumps({k: v for k, v in self.headers.items()}))
 
-        # Optional: enforce Pangolin security header if configured
+        # Optional: enforce Pangolin custom header if configured
         if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
             actual = self.headers.get(EXPECTED_PANGOLIN_HEADER_KEY)
             if actual is None or actual != EXPECTED_PANGOLIN_HEADER_VALUE:
                 self.send_response(403)
                 self.end_headers()
-                self.wfile.write(b"Forbidden: missing or invalid Pangolin security header")
+                self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
                 return
 
         # Always require Remote-User header as a basic Pangolin proxy signal
@@ -341,7 +341,7 @@ def main():
     if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
         print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are set. The service will enforce these headers from pangolin.")
     else:
-        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are not set. The service will not enforce any additional security headers.")
+        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are not set. The service will not enforce any additional custom headers.")
 
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
