@@ -261,11 +261,7 @@ class BannerHandler(BaseHTTPRequestHandler):
         return self.client_address[0]
 
     def do_GET(self):
-
         ip = self._get_real_ip()
-
-        # Log all request headers
-        print("[headers]", json.dumps({k: v for k, v in self.headers.items()}))
 
         # Always require Remote-User header as a basic Pangolin proxy signal
         remote_user = self.headers.get("Remote-User")
