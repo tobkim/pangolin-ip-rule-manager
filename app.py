@@ -272,9 +272,15 @@ class BannerHandler(BaseHTTPRequestHandler):
         print("[headers]", json.dumps({k: v for k, v in self.headers.items()}))
 
         # Optional: enforce Pangolin security header if configured
-        if EXPECTED_PANGOLIN_HEADER_KEY and EXPECTED_PANGOLIN_HEADER_VALUE:
+        if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
+            # If only one is configured, consider it misconfigured and reject all requests
+            if not (EXPECTED_PANGOLIN_HEADER_KEY and EXPECTED_PANGOLIN_HEADER_VALUE):
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"Forbidden: security header misconfigured; both key and value must be configured")
+                return
             actual = self.headers.get(EXPECTED_PANGOLIN_HEADER_KEY)
-            if actual != EXPECTED_PANGOLIN_HEADER_VALUE:
+            if actual is None or actual != EXPECTED_PANGOLIN_HEADER_VALUE:
                 self.send_response(403)
                 self.end_headers()
                 self.wfile.write(b"Forbidden: missing or invalid Pangolin security header")
@@ -338,7 +344,9 @@ def main():
     load_state()
     # Fetch and print resources for the configured org (helper for selecting resource IDs)
     print_org_resources()
-
+    if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
+        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are set. The service will enforce these headers from pangolin.")
+        
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
     t.start()
