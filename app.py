@@ -261,15 +261,22 @@ class BannerHandler(BaseHTTPRequestHandler):
         return self.client_address[0]
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path != "/banner.png":
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not found")
-            return
+
+        ip = self._get_real_ip()
 
         # Log all request headers
         print("[headers]", json.dumps({k: v for k, v in self.headers.items()}))
+
+        # Always require Remote-User header as a basic Pangolin proxy signal
+        remote_user = self.headers.get("Remote-User")
+        if not remote_user:
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden: Remote-User header required to ensure this request comes via Pangolin")
+            return
+
+        # Log all request headers
+        print("New request from", ip, " user:", remote_user, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
 
         # Optional: enforce Pangolin custom header if configured
         if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
@@ -280,15 +287,13 @@ class BannerHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
                 return
 
-        # Always require Remote-User header as a basic Pangolin proxy signal
-        remote_user = self.headers.get("Remote-User")
-        if not remote_user:
-            self.send_response(403)
+        parsed = urlparse(self.path)
+        if parsed.path != "/banner.png":
+            self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Forbidden: Remote-User header required to ensure this request comes via Pangolin")
+            self.wfile.write(b"Not found")
             return
 
-        ip = self._get_real_ip()
         # Update state and ensure rules
         with state_lock:
             rec = state.setdefault(ip, {"last_seen": now_utc_iso(), "resources": {}})
