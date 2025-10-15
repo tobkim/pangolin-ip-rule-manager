@@ -278,7 +278,7 @@ class BannerHandler(BaseHTTPRequestHandler):
             rec["last_seen"] = now_utc_iso()
         save_state()
 
-        # Perform Pangolin ensure synchronously (simple, small scale)
+        # Perform Pangolin call synchronously (simple, small scale)
         try:
             ensure_ip_rule(ip)
         except Exception as e:
@@ -330,7 +330,7 @@ def main():
     httpd = HTTPServer(addr, BannerHandler)
     print(f"[start] Listening on {addr[0]}:{addr[1]} | resources={RESOURCE_IDS} | retention_minutes={RETENTION_MINUTES} | cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES}")
     print("[SECURITY] You are responsible for protecting access to this service via Pangolin (ACLs/reverse proxy). Do NOT expose it publicly. Keep PANGOLIN_TOKEN secret.")
-    print("[start] Remote-User header is required")
+
     httpd.serve_forever()
 
 

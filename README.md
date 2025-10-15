@@ -53,8 +53,8 @@ cd pangolin-ip-rule-manager
 2) Copy config.env.sample to config.env and update the values.
   - PANGOLIN_URL: Your Pangolin API base URL
   - ORG_ID: Your Pangolin organization ID (string)
-  - PANGOLIN_TOKEN: API token with the required permissions
-  - RESOURCE_IDS: Comma-separated list of resource IDs to manage (e.g., 2,7,12). The available resource ids are listed in the logs at the start of the container.
+  - PANGOLIN_TOKEN: API token with the required permissions (see below)
+  - RESOURCE_IDS: Comma-separated list of resource IDs to manage (e.g., 2,7,12). The available resource ids cannot be seen anymore in the newer pangolin versions. They are listed in the logs at the start of the container to help you out.
 
 3) Start the service
 
