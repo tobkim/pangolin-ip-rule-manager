@@ -20,7 +20,9 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 ## Key Properties
 - Extremely small and simple: Python stdlib only, no external dependencies
 - Single endpoint: `GET /banner.png` returns a 1×1 transparent PNG
-- Security header check: `Remote-User` header is always required
+- Security enforcement:
+  - `Remote-User` header is always required
+  - Optional custom header (see EXPECTED_PANGOLIN_HEADER_KEY/EXPECTED_PANGOLIN_HEADER_VALUE) can additionally be enforced if configured
 - IP extraction from `X-Real-IP`, then `X-Forwarded-For`, then socket address
 - Pangolin API integration: GET current rules, PUT to add, DELETE to remove
 - Persistent state: JSON file (default at `/data/state.json`, persisted via a Docker volume in the provided compose file)
@@ -39,6 +41,8 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 - `CLEANUP_INTERVAL_MINUTES`: Cleanup frequency in minutes (default: `60` = 1 hour)
 - `RULE_PRIORITY`: Rule priority when creating rules (default: `0`)
 - `RULES_CACHE_TTL_SECONDS`: Seconds to cache rule-existence checks per resource (default: `3600`)
+- `EXPECTED_PANGOLIN_HEADER_KEY`: Optional. If set together with EXPECTED_PANGOLIN_HEADER_VALUE, incoming requests must include this header key with the exact value.
+- `EXPECTED_PANGOLIN_HEADER_VALUE`: Optional. See above. Configure the same header in Pangolin on the resource fronting this service.
 
 ---
 
@@ -73,6 +77,7 @@ docker compose up -d
 ## Behavior
 - On startup, the service fetches and prints the list of resources for `ORG_ID` from Pangolin, showing name and `resourceId` to help you choose `RESOURCE_IDS`.
 - If `Remote-User` is missing, returns `403`.
+- If `EXPECTED_PANGOLIN_HEADER_KEY` and `EXPECTED_PANGOLIN_HEADER_VALUE` are both set and the incoming request either lacks the header or has a different value, returns `403`.
 - On each successful request, the real IP is determined and this service:
   - Updates `last_seen` for that IP in the state file
   - Checks Pangolin rules for each `resourceId` and creates one if missing (rule-existence checks are cached per resource for about 1 hour, configurable)

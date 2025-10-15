@@ -20,6 +20,9 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60"))  # default 1 hour in minutes
 RULE_PRIORITY = int(os.getenv("RULE_PRIORITY", "0"))
 RULES_CACHE_TTL_SECONDS = int(os.getenv("RULES_CACHE_TTL_SECONDS", "3600"))  # cache for existence checks (~1h)
+# Optional Pangolin header gate: if both are non-empty, require incoming requests to include this header key with exact value
+EXPECTED_PANGOLIN_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_HEADER_KEY", "").strip()
+EXPECTED_PANGOLIN_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_HEADER_VALUE", "").strip()
 
 # Minimal 1x1 PNG (transparent) as bytes
 BANNER_PNG = base64.b64decode(
@@ -189,50 +192,54 @@ def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
         return False
 
 
+def cleanup_once():
+    print("[cleanup] starting")
+    print("current ips allowed:" , str(state))
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=RETENTION_MINUTES)
+    with state_lock:
+        ips = list(state.keys())
+    for ip in ips:
+        with state_lock:
+            rec = state.get(ip) or {}
+            last_seen_str = rec.get("last_seen")
+            resources = rec.get("resources", {})
+        try:
+            last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")) if last_seen_str else None
+        except Exception:
+            last_seen = None
+        if not last_seen or last_seen > cutoff:
+            continue
+        # Time to cleanup per resource if created_by_us
+        changed = False
+        for rid_str, meta in list(resources.items()):
+            rid = int(rid_str)
+            if not meta.get("created_by_us"):
+                continue
+            if delete_ip_rule_if_created_by_us(ip, rid):
+                # Remove our reference
+                with state_lock:
+                    rec2 = state.get(ip)
+                    if rec2 and rid_str in rec2.get("resources", {}):
+                        rec2["resources"].pop(rid_str, None)
+                        changed = True
+        # If no resources remain, drop the IP record
+        with state_lock:
+            rec3 = state.get(ip)
+            if rec3 and not rec3.get("resources"):
+                state.pop(ip, None)
+                changed = True
+        if changed:
+            save_state()
+        print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
+    print("[cleanup] done")
+
+
 def cleanup_loop():
     while True:
         try:
-            print("[cleanup] starting")
-            print("current ips allowed:" , str(state))
-            cutoff = datetime.now(timezone.utc) - timedelta(minutes=RETENTION_MINUTES)
-            with state_lock:
-                ips = list(state.keys())
-            for ip in ips:
-                with state_lock:
-                    rec = state.get(ip) or {}
-                    last_seen_str = rec.get("last_seen")
-                    resources = rec.get("resources", {})
-                try:
-                    last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")) if last_seen_str else None
-                except Exception:
-                    last_seen = None
-                if not last_seen or last_seen > cutoff:
-                    continue
-                # Time to cleanup per resource if created_by_us
-                changed = False
-                for rid_str, meta in list(resources.items()):
-                    rid = int(rid_str)
-                    if not meta.get("created_by_us"):
-                        continue
-                    if delete_ip_rule_if_created_by_us(ip, rid):
-                        # Remove our reference
-                        with state_lock:
-                            rec2 = state.get(ip)
-                            if rec2 and rid_str in rec2.get("resources", {}):
-                                rec2["resources"].pop(rid_str, None)
-                                changed = True
-                # If no resources remain, drop the IP record
-                with state_lock:
-                    rec3 = state.get(ip)
-                    if rec3 and not rec3.get("resources"):
-                        state.pop(ip, None)
-                        changed = True
-                if changed:
-                    save_state()
-                print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
+            cleanup_once()
         except Exception as e:
             print(f"[cleanup] unexpected error: {e}")
-        print("[cleanup] done")
         time.sleep(CLEANUP_INTERVAL_MINUTES*60)
 
 
@@ -264,11 +271,21 @@ class BannerHandler(BaseHTTPRequestHandler):
         # Log all request headers
         print("[headers]", json.dumps({k: v for k, v in self.headers.items()}))
 
+        # Optional: enforce Pangolin security header if configured
+        if EXPECTED_PANGOLIN_HEADER_KEY and EXPECTED_PANGOLIN_HEADER_VALUE:
+            actual = self.headers.get(EXPECTED_PANGOLIN_HEADER_KEY)
+            if actual != EXPECTED_PANGOLIN_HEADER_VALUE:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"Forbidden: missing or invalid Pangolin security header")
+                return
+
+        # Always require Remote-User header as a basic Pangolin proxy signal
         remote_user = self.headers.get("Remote-User")
         if not remote_user:
             self.send_response(403)
             self.end_headers()
-            self.wfile.write(b"Forbidden: Remote-User Header required to ensure this request comes via Pangolin")
+            self.wfile.write(b"Forbidden: Remote-User header required to ensure this request comes via Pangolin")
             return
 
         ip = self._get_real_ip()
