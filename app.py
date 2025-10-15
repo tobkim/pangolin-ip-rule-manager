@@ -20,9 +20,11 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60"))  # default 1 hour in minutes
 RULE_PRIORITY = int(os.getenv("RULE_PRIORITY", "0"))
 RULES_CACHE_TTL_SECONDS = int(os.getenv("RULES_CACHE_TTL_SECONDS", "3600"))  # cache for existence checks (~1h)
-# Optional Pangolin header gate: if both are non-empty, require incoming requests to include this header key with exact value
-EXPECTED_PANGOLIN_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_HEADER_KEY", "").strip()
-EXPECTED_PANGOLIN_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_HEADER_VALUE", "").strip()
+# Mandatory Pangolin custom header gate: both must be set and non-empty
+EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", "").strip()
+EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", "").strip()
+if not EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY or not EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE:
+    raise RuntimeError("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY and EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE must be set and non-empty")
 
 # Minimal 1x1 PNG (transparent) as bytes
 BANNER_PNG = base64.b64decode(
@@ -263,25 +265,18 @@ class BannerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         ip = self._get_real_ip()
 
-        # Always require Remote-User header as a basic Pangolin proxy signal
-        remote_user = self.headers.get("Remote-User")
-        if not remote_user:
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"Forbidden: Remote-User header required to ensure this request comes via Pangolin")
-            return
+        remote_user = self.headers.get("Remote-User","")
 
         # Log all request headers
         print("New request from", ip, " user:", remote_user, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
 
-        # Optional: enforce Pangolin custom header if configured
-        if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
-            actual = self.headers.get(EXPECTED_PANGOLIN_HEADER_KEY)
-            if actual is None or actual != EXPECTED_PANGOLIN_HEADER_VALUE:
-                self.send_response(403)
-                self.end_headers()
-                self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
-                return
+        # Enforce Pangolin custom header (mandatory)
+        actual = self.headers.get(EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY)
+        if actual is None or actual != EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE:
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
+            return
 
         parsed = urlparse(self.path)
         if parsed.path != "/banner.png":
@@ -310,10 +305,32 @@ class BannerHandler(BaseHTTPRequestHandler):
         self.wfile.write(BANNER_PNG)
 
 
-def print_org_resources():
+def self_check():
+    # Double-check mandatory environment settings and print useful warnings/summary.
+    missing = []
+    if not EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY:
+        missing.append("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY")
+    if not EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE:
+        missing.append("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE")
+    if missing:
+        # Keep behavior aligned with import-time validation, but provide a clear error here as well
+        raise RuntimeError(
+            "Missing required environment variables: " + ", ".join(missing)
+        )
+
     if not PANGOLIN_TOKEN:
-        print("[pangolin] No PANGOLIN_TOKEN set; skipping org resources listing.")
-        return
+        print("[warn] PANGOLIN_TOKEN is not set; Pangolin API actions will be skipped.")
+    if not RESOURCE_IDS:
+        print("[warn] RESOURCE_IDS is empty; no resources will be managed.")
+
+    print(
+        f"[self-check] OK. listen_port={LISTEN_PORT} state_file={STATE_FILE} "
+        f"resources={RESOURCE_IDS} retention_minutes={RETENTION_MINUTES} "
+        f"cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES} rule_priority={RULE_PRIORITY}"
+    )
+
+
+def print_org_resources():
     try:
         url = f"{PANGOLIN_URL}/v1/org/{ORG_ID}/resources?limit=1000&offset=0"
         resp = http_json("GET", url)
@@ -336,13 +353,10 @@ def print_org_resources():
 
 
 def main():
+    self_check()
     load_state()
     # Fetch and print resources for the configured org (helper for selecting resource IDs)
     print_org_resources()
-    if EXPECTED_PANGOLIN_HEADER_KEY or EXPECTED_PANGOLIN_HEADER_VALUE:
-        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are set. The service will enforce these headers from pangolin.")
-    else:
-        print("EXPECTED_PANGOLIN_HEADER_KEY/VALUE are not set. The service will not enforce any additional custom headers.")
 
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
@@ -351,7 +365,6 @@ def main():
     addr = ("0.0.0.0", LISTEN_PORT)
     httpd = HTTPServer(addr, BannerHandler)
     print(f"[start] Listening on {addr[0]}:{addr[1]} | resources={RESOURCE_IDS} | retention_minutes={RETENTION_MINUTES} | cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES}")
-    print("[SECURITY] You are responsible for protecting access to this service via Pangolin (ACLs/reverse proxy). Do NOT expose it publicly. Keep PANGOLIN_TOKEN secret.")
 
     httpd.serve_forever()
 
