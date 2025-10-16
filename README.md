@@ -49,6 +49,7 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 - `CROWDSEC_ALLOWLIST_NAME`: Name of the CrowdSec allowlist to manage (default: `pangolin-ip-rule-manager`). At startup, the tool checks if it exists and creates it via `cscli` if missing.
 - `CROWDSEC_CSCLI_BIN`: Path/name of the `cscli` binary (default: `cscli`).
 - `CROWDSEC_CMD_PREFIX`: Optional command prefix to run `cscli` (e.g., `docker exec crowdsec`). Useful if CrowdSec runs in a container.
+- `CROWDSEC_CACHE_TTL_SECONDS`: Seconds to cache membership checks for the named allowlist (default: `3600`). If an IP is not in the cache, the service first verifies with `cscli allowlist <name> list` before adding/removing.
 
 Behavior when enabled:
 - On startup, ensure the named allowlist exists (create if needed).
@@ -57,6 +58,7 @@ Behavior when enabled:
 
 Notes:
 - This uses `cscli` on the same Docker host. If CrowdSec runs in a container, ensure this service can run `docker exec crowdsec cscli ...` (e.g., by mounting the Docker socket or running on the host).
+- CrowdSec allowlist membership is cached to avoid running commands on every request. If an IP isn't in the cache, the service first verifies the current contents via `cscli allowlist <name> list` before attempting add/remove.
 - Commands are attempted across common `cscli` versions; warnings are logged if commands are unavailable.
 
 ---

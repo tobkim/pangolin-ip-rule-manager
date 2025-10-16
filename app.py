@@ -252,14 +252,15 @@ def _crowdsec_refresh_allowlist_ip_set() -> set[str]:
     if not CROWDSEC_ENABLED:
         return set()
     # try variants (prefer JSON)
+    ip_set: set[str] = set()
 
-    args = ["allowlist", CROWDSEC_ALLOWLIST_NAME, "list", "-o", "json"]
+    args = ["allowlist", "inspect", CROWDSEC_ALLOWLIST_NAME, "-o", "json"]
 
     rc, out, err = run_cscli(args)
-    parsed = _parse_crowdsec_entries_from_json(out)
-
-    if parsed:
-        ip_set = parsed
+    if rc == 0 and out:
+        parsed = _parse_crowdsec_entries_from_json(out)
+        if parsed:
+            ip_set = parsed
 
     now_ts = time.time()
     with state_lock:

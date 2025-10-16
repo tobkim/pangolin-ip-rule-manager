@@ -4,14 +4,6 @@ FROM python:3.12-alpine
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
-COPY app.py /app/app.py
-
-# Install Docker CLI for optional CrowdSec integration via 'docker exec crowdsec cscli ...'
-RUN apk add --no-cache docker-cli
-
-EXPOSE 8080
-
 # Default configuration can be overridden via env at runtime
 ENV PANGOLIN_URL="https://api.url.of.your.pangolin.instance" \
     PANGOLIN_TOKEN="your_pangolin_token" \
@@ -23,5 +15,13 @@ ENV PANGOLIN_URL="https://api.url.of.your.pangolin.instance" \
     CLEANUP_INTERVAL_MINUTES="60" \
     RULE_PRIORITY="0" \
     RULES_CACHE_TTL_SECONDS="3600"
+
+WORKDIR /app
+COPY app.py /app/app.py
+
+EXPOSE 8080
+
+# Install Docker CLI for optional CrowdSec integration via 'docker exec crowdsec cscli ...'
+RUN apk add --no-cache docker-cli
 
 CMD ["python", "/app/app.py"]
