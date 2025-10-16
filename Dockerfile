@@ -19,7 +19,8 @@ ENV PANGOLIN_URL="https://api.url.of.your.pangolin.instance" \
     RULES_CACHE_TTL_SECONDS="3600"
 
 WORKDIR /app
-COPY app.py /app/app.py
+# Copy all application modules (after refactor we have multiple .py files)
+COPY *.py /app/
 
 EXPOSE 8080
 
