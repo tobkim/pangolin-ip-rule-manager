@@ -40,6 +40,10 @@ if not EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY or not EXPECTED_PANGOLIN_CUSTOM_HEADE
 BANNER_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
+# Minimal 1x1 GIF (transparent) as bytes
+BANNER_GIF = base64.b64decode(
+    "R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw=="
+)
 
 state_lock = threading.Lock()
 state = {
@@ -552,11 +556,23 @@ class BannerHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
-        if parsed.path != "/banner.png":
+        path = (parsed.path or "/")
+        lower_path = path.lower()
+        # Explicitly forbid root path even if header is correct
+        if path == "/":
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden")
+            print(f"[error] Root path forbidden: {self.path}")
+            return
+        # Only serve PNG or GIF transparent images; other paths -> 404
+        is_png = lower_path.endswith(".png")
+        is_gif = lower_path.endswith(".gif")
+        if not (is_png or is_gif):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found")
-            print(f"[error] Invalid path: {self.path}")
+            print(f"[error] Invalid path (not .png/.gif): {self.path}")
             return
 
         # Update state and ensure rules
@@ -571,12 +587,15 @@ class BannerHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[error] add_ip_to_targets failed for {ip}: {e}")
 
-        # Serve PNG
+        # Serve transparent image according to extension
+        body = BANNER_GIF if is_gif else BANNER_PNG
+        ctype = "image/gif" if is_gif else "image/png"
+        print(f"[http] Serving {ctype} for path '{path}' to IP {ip}")
         self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(BANNER_PNG)))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(BANNER_PNG)
+        self.wfile.write(body)
 
 
 def self_check():
