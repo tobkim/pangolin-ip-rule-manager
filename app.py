@@ -175,7 +175,7 @@ def crowdsec_allowlist_exists(name: str) -> bool:
 
 def crowdsec_create_allowlist(name: str) -> bool:
     # Try modern command
-    args = ["allowlist", "create", name]
+    args = ["allowlist", "create", name, "-d", "allowlist created by pangolin-ip-rule-manager"]
     rc, out, err = run_cscli(args)
     if rc == 0:
         print(f"[crowdsec] created allowlist '{name}' via: {' '.join(args)}")
