@@ -252,9 +252,7 @@ def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
 def cleanup_old_ips():
     print("[cleanup] starting")
     # Avoid dumping the entire state (privacy/noise); log a summary count instead
-    with state_lock:
-        state_count = len(state)
-    print(f"[cleanup] current IPs in state: {state_count}")
+
     # Use second-level precision to align with stored timestamps (now_utc_iso has no microseconds)
     now_sec = datetime.now(timezone.utc).replace(microsecond=0)
     cutoff = now_sec - timedelta(minutes=RETENTION_MINUTES)
@@ -331,9 +329,6 @@ def _make_image_handler_context() -> dict:
 
 # Expose the HTTP handler class (renamed from BannerHandler)
 ImageRequestHandler = create_image_request_handler(_make_image_handler_context())
-# Backward compatibility for external users/tests that still reference BannerHandler
-BannerHandler = ImageRequestHandler
-
 
 def self_check():
     # Double-check mandatory environment settings and print useful warnings/summary.
