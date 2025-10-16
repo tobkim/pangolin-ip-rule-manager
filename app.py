@@ -202,36 +202,22 @@ def crowdsec_add_ip(ip: str) -> None:
     if not CROWDSEC_ENABLED:
         return
     crowdsec_ensure_allowlist()
-    # Try variants across versions
-    candidate_cmds = [
-        ["allowlist", "add", "-n", CROWDSEC_ALLOWLIST_NAME, "-i", ip],
-        ["allowlist", "add", "--name", CROWDSEC_ALLOWLIST_NAME, "--ip", ip],
-        ["allowlists", "add", "-n", CROWDSEC_ALLOWLIST_NAME, "-i", ip],
-        ["allowlist", "add", CROWDSEC_ALLOWLIST_NAME, "--ip", ip],
-    ]
-    for args in candidate_cmds:
-        rc, out, err = run_cscli(args)
-        if rc == 0:
-            print(f"[crowdsec] added {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
-            return
-    print(f"[crowdsec] WARNING: failed to add {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+    args = ["allowlist", "add", CROWDSEC_ALLOWLIST_NAME, ip, "-d", "added on " + now_utc_iso() + " by pangolin-ip-rule-manager"]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] added {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        return
+    print(f"[crowdsec] WARNING: failed to add {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'", rc, out, err)
 
 
 def crowdsec_remove_ip(ip: str) -> None:
     if not CROWDSEC_ENABLED:
         return
-    # Try variants across versions
-    candidate_cmds = [
-        ["allowlist", "delete", "-n", CROWDSEC_ALLOWLIST_NAME, "-i", ip],
-        ["allowlist", "delete", "--name", CROWDSEC_ALLOWLIST_NAME, "--ip", ip],
-        ["allowlists", "delete", "-n", CROWDSEC_ALLOWLIST_NAME, "-i", ip],
-        ["allowlist", "remove", "-n", CROWDSEC_ALLOWLIST_NAME, "-i", ip],
-    ]
-    for args in candidate_cmds:
-        rc, out, err = run_cscli(args)
-        if rc == 0:
-            print(f"[crowdsec] removed {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
-            return
+    args = ["allowlist", "remove", CROWDSEC_ALLOWLIST_NAME, ip]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] removed {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        return
     print(f"[crowdsec] WARNING: failed to remove {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
 
 
