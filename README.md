@@ -1,22 +1,10 @@
 # Pangolin IP Rule Manager
 
-A tiny Dockerized web server that serves a single file and, for each request to it, puts the requester's IP in an ACCEPT rule in Pangolin VPN across configured resources, e.g. to 'unlock' Jellyfin on a Smart TV or other apps that need full access to a resource. It persists a small hashmap of seen IPs and periodically deletes rules created by this service if the IP has not been seen for a configurable number of minutes.
+This service serves a 1×1 transparent image at any path ending with .png or .gif. Each request is treated as a heartbeat from the client's IP address, adding an IP Rule in Pangolin for some of your resources. Optionally, it can also allowlist your IP with your crowdsec instance. A background task cleans up the rules if an IP hasn't been seen for a configurable period.
 
 Tested with Pangolin v1.10.3.
 
 ---
-
-## Important Warning
-- You are responsible for securing access to this service via Pangolin (and/or your reverse proxy). Do NOT expose it publicly without strict Pangolin ACLs limiting who can reach the image endpoints (e.g., /checkin.png).
-- Keep your `PANGOLIN_TOKEN` secret and rotate it periodically.
-
----
-
-## Overview
-This service serves a 1×1 transparent image at any path ending with .png or .gif. Each request is treated as a heartbeat from the client's IP address, prompting rule creation (if needed) in Pangolin for configured resources. A background task cleans up rules created by this service if the IP hasn't been seen for a configurable period.
-
----
-
 
 ## Run with Docker Compose (recommended)
 1) Clone this repository and change into the directory
@@ -54,23 +42,16 @@ docker compose up -d
 - `EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY`: Required. Incoming requests must include this header with the exact value below.
 - `EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE`: Required. Configure the same header in Pangolin on the resource fronting this service.- 
 - `RETENTION_MINUTES`: Minutes without seeing an IP before cleanup deletes rules (default: `1440` = 1 day)
-- `LISTEN_PORT`: HTTP listen port (default: `8080`)
-- `STATE_FILE`: Path to JSON state file (default: `/data/state.json`)
 - `CLEANUP_INTERVAL_MINUTES`: Cleanup frequency in minutes (default: `60` = 1 hour)
-- `RULE_PRIORITY`: Rule priority when creating rules (default: `0`)
-- `RULES_CACHE_TTL_SECONDS`: Seconds to cache rule-existence checks per resource (default: `3600`)
 
 ### Optional: CrowdSec integration (allowlist)
 - `CROWDSEC_ENABLED`: Set to `true` to enable CrowdSec integration (default: `false`).
-- `CROWDSEC_ALLOWLIST_NAME`: Name of the CrowdSec allowlist to manage (default: `pangolin-ip-rule-manager`). At startup, the tool checks if it exists and creates it via `cscli` if missing.
-- `CROWDSEC_CSCLI_BIN`: Path/name of the `cscli` binary (default: `cscli`).
-- `CROWDSEC_CMD_PREFIX`: Optional command prefix to run `cscli` (e.g., `docker exec crowdsec`). Useful if CrowdSec runs in a container.
-- `CROWDSEC_CACHE_TTL_SECONDS`: Seconds to cache membership checks for the named allowlist (default: `3600`). If an IP is not in the cache, the service first verifies with `cscli allowlist <name> list` before adding/removing.
+- see config.env.sample for other default values
 
 Behavior when enabled:
 - On startup, ensure the named allowlist exists (create if needed).
-- On each successful `/banner.png` request, also add the IP to the allowlist.
-- When an IP expires per `RETENTION_MINUTES`, remove it from the allowlist during cleanup.
+- On each successful `/whatever.png` request, also add the IP to the allowlists.
+- When an IP expires per `RETENTION_MINUTES`, remove it from the allowlists during cleanup.
 
 Notes:
 - This uses `cscli` on the same Docker host. If CrowdSec runs in a container, ensure this service can run `docker exec crowdsec cscli ...` (e.g., by mounting the Docker socket or running on the host).
