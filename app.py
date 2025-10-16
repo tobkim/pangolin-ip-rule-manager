@@ -175,16 +175,12 @@ def crowdsec_allowlist_exists(name: str) -> bool:
 
 def crowdsec_create_allowlist(name: str) -> bool:
     # Try modern command
-    for args in (
-        ["allowlist", "create", name],
-        ["allowlists", "create", name],  # legacy
-        ["allowlist", "add", name],  # some versions accept additive create
-    ):
-        rc, out, err = run_cscli(args)
-        if rc == 0:
-            print(f"[crowdsec] created allowlist '{name}' via: {' '.join(args)}")
-            return True
-    print(f"[crowdsec] failed to create allowlist '{name}'")
+    args = ["allowlist", "create", name]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] created allowlist '{name}' via: {' '.join(args)}")
+        return True
+    print(f"[crowdsec] failed to create allowlist '{name}'", rc, out, err)
     return False
 
 
