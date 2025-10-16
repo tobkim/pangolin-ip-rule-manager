@@ -12,9 +12,10 @@ Tested with Pangolin v1.10.3.
 ```bash
 git clone https://github.com/tobkim/pangolin-ip-rule-manager.git
 cd pangolin-ip-rule-manager
+cp config.env.sample config.env
 ```
 
-2) Copy config.env.sample to config.env and update the values.
+2) Configure the values in config.env:
   - PANGOLIN_URL: Your Pangolin API base URL
   - ORG_ID: Your Pangolin organization ID (string)
   - PANGOLIN_TOKEN: API token with the required permissions (see below)
