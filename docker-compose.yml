@@ -20,6 +20,11 @@ services:
       LISTEN_PORT: "8080"
       STATE_FILE: /data/state.json   # store state inside a dedicated data volume
       RULE_PRIORITY: "0"
+      # Optional CrowdSec integration (prefer configuring via env_file: config.env)
+      # CROWDSEC_ENABLED: "false"
+      # CROWDSEC_ALLOWLIST_NAME: pangolin-ip-rule-manager
+      # CROWDSEC_CSCLI_BIN: cscli
+      # CROWDSEC_CMD_PREFIX: "docker exec crowdsec"
 
     networks:
       - pangolin # put in pangolin network
@@ -27,6 +32,8 @@ services:
     # Persist only the state file. The application code stays inside the image.
     volumes:
       - pangolin-ip-rule-manager-data:/data
+      # Allow running 'docker exec crowdsec cscli ...' from inside this container
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
     restart: unless-stopped
 

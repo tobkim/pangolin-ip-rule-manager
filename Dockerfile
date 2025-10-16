@@ -7,6 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY app.py /app/app.py
 
+# Install Docker CLI for optional CrowdSec integration via 'docker exec crowdsec cscli ...'
+RUN apk add --no-cache docker-cli
+
 EXPOSE 8080
 
 # Default configuration can be overridden via env at runtime

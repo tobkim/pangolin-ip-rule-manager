@@ -26,6 +26,7 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 - Pangolin API integration: GET current rules, PUT to add, DELETE to remove
 - Persistent state: JSON file (default at `/data/state.json`, persisted via a Docker volume in the provided compose file)
 - Background cleanup thread removes stale rules created by this service
+- Optional CrowdSec integration: add/remove IPs from a named CrowdSec allowlist via `cscli` (when enabled)
 
 ---
 
@@ -43,6 +44,20 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 - `RULE_PRIORITY`: Rule priority when creating rules (default: `0`)
 - `RULES_CACHE_TTL_SECONDS`: Seconds to cache rule-existence checks per resource (default: `3600`)
 
+### Optional: CrowdSec integration (allowlist)
+- `CROWDSEC_ENABLED`: Set to `true` to enable CrowdSec integration (default: `false`).
+- `CROWDSEC_ALLOWLIST_NAME`: Name of the CrowdSec allowlist to manage (default: `pangolin-ip-rule-manager`). At startup, the tool checks if it exists and creates it via `cscli` if missing.
+- `CROWDSEC_CSCLI_BIN`: Path/name of the `cscli` binary (default: `cscli`).
+- `CROWDSEC_CMD_PREFIX`: Optional command prefix to run `cscli` (e.g., `docker exec crowdsec`). Useful if CrowdSec runs in a container.
+
+Behavior when enabled:
+- On startup, ensure the named allowlist exists (create if needed).
+- On each successful `/banner.png` request, also add the IP to the allowlist.
+- When an IP expires per `RETENTION_MINUTES`, remove it from the allowlist during cleanup.
+
+Notes:
+- This uses `cscli` on the same Docker host. If CrowdSec runs in a container, ensure this service can run `docker exec crowdsec cscli ...` (e.g., by mounting the Docker socket or running on the host).
+- Commands are attempted across common `cscli` versions; warnings are logged if commands are unavailable.
 
 ---
 
