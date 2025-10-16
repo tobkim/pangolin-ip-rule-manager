@@ -64,7 +64,7 @@ def test_banner_serves_png_and_updates_state(app_module):
 
     test_ip = "1.2.3.4"
 
-    with start_server(app.BannerHandler) as (httpd, port):
+    with start_server(app.ImageRequestHandler) as (httpd, port):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {
             "X-Real-IP": test_ip,
@@ -99,7 +99,7 @@ def test_security_header_enforced(monkeypatch, temp_state_file):
     with app.state_lock:
         app.state.clear()
 
-    with start_server(app.BannerHandler) as (httpd, port):
+    with start_server(app.ImageRequestHandler) as (httpd, port):
         # Missing header -> 403
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request("GET", "/banner.png")
@@ -207,7 +207,7 @@ def test_gif_serves_gif_and_updates_state(app_module):
 
     test_ip = "6.7.8.9"
 
-    with start_server(app.BannerHandler) as (httpd, port):
+    with start_server(app.ImageRequestHandler) as (httpd, port):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {
             "X-Real-IP": test_ip,
@@ -227,7 +227,7 @@ def test_gif_serves_gif_and_updates_state(app_module):
 def test_invalid_paths_denied(app_module):
     app = app_module
 
-    with start_server(app.BannerHandler) as (httpd, port):
+    with start_server(app.ImageRequestHandler) as (httpd, port):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {
             app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE,
