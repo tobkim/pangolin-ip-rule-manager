@@ -3,14 +3,24 @@ import json
 import os
 import threading
 import time
-import subprocess
-import shlex
-import ipaddress
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+from crowdsec_connector import (
+    crowdsec_add_ip,
+    crowdsec_remove_ip,
+    crowdsec_ensure_allowlist,
+)
+from pangolin_connector import (
+    PangolinContext,
+    get_ip_set_for_resource_cached as pg_get_ip_set_for_resource_cached,
+    ensure_ip_rule as pg_ensure_ip_rule,
+    delete_ip_rule_if_created_by_us as pg_delete_ip_rule_if_created_by_us,
+    list_org_resources as pg_list_org_resources,
+)
 
 # Config via environment
 PANGOLIN_URL = os.getenv("PANGOLIN_URL", "https://api.url.of.your.pangolin.instance").rstrip("/")
@@ -68,6 +78,26 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def redact_headers_for_log(headers: dict[str, str]) -> dict[str, str]:
+    """Return a copy of headers suitable for logging.
+    - Redacts Authorization/Proxy-Authorization values
+    - Masks the expected Pangolin custom header value to avoid leaking secrets
+    Header names are matched case-insensitively.
+    """
+    redacted: dict[str, str] = {}
+    expected_key_lower = EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY.lower() if EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY else None
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl in ("authorization", "proxy-authorization"):
+            redacted[k] = "<redacted>"
+        elif expected_key_lower and kl == expected_key_lower:
+            # Don't log secret value; only indicate presence
+            redacted[k] = "<present>" if v else "<missing>"
+        else:
+            redacted[k] = v
+    return redacted
+
+
 def load_state():
     global state
     if not os.path.exists(STATE_FILE):
@@ -119,297 +149,77 @@ def http_json(method: str, url: str, body: dict | None = None) -> dict:
         raise RuntimeError(f"Network error: {e}")
 
 
-# --------------------------
-# CrowdSec integration
-# --------------------------
-
-def _build_cscli_cmd(args: list[str]) -> list[str]:
-    parts: list[str] = []
-    if CROWDSEC_CMD_PREFIX:
-        try:
-            parts.extend(shlex.split(CROWDSEC_CMD_PREFIX))
-        except Exception:
-            parts.append(CROWDSEC_CMD_PREFIX)
-    parts.append(CROWDSEC_CSCLI_BIN)
-    parts.extend(args)
-    return parts
 
 
-def run_cscli(args: list[str]) -> tuple[int, str, str]:
-    """Run cscli command. Returns (returncode, stdout, stderr)."""
-    try:
-        proc = subprocess.run(
-            _build_cscli_cmd(args),
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-    except FileNotFoundError:
-        return 127, "", "cscli not found"
-    except Exception as e:
-        return 1, "", str(e)
+
+# Targets common interface
+class Target:
+    def ensure_ready(self) -> None:
+        pass
+
+    def add_ip(self, ip: str) -> None:
+        raise NotImplementedError
+
+    def expire_ip(self, ip: str) -> None:
+        pass
 
 
-def crowdsec_allowlist_exists(name: str) -> bool:
-    # Prefer JSON output if available
-    rc, out, err = run_cscli(["allowlist", "list", "-o", "json"])  # newest cscli
-    if rc == 0 and out:
-        try:
-            data = json.loads(out)
-            # expect list of allowlists with name fields
-            if isinstance(data, list):
-                return any((isinstance(x, dict) and x.get("name") == name) for x in data)
-        except Exception:
-            pass
-    else:
-        # try legacy plural command
-        rc2, out2, _ = run_cscli(["allowlists", "list", "-o", "json"])  # legacy
-        if rc2 == 0 and out2:
-            try:
-                data = json.loads(out2)
-                if isinstance(data, list):
-                    return any((isinstance(x, dict) and x.get("name") == name) for x in data)
-            except Exception:
-                pass
-    # Fallback: plain text search
-    for args in (["allowlist", "list"], ["allowlists", "list"]):
-        rc3, out3, _ = run_cscli(args)
-        if rc3 == 0 and out3:
-            if name in out3:
-                return True
-    return False
+class PangolinTarget(Target):
+    def __init__(self, ctx_factory):
+        self._ctx_factory = ctx_factory
 
+    def add_ip(self, ip: str) -> None:
+        ctx = self._ctx_factory()
+        pg_ensure_ip_rule(ctx, ip)
 
-def crowdsec_create_allowlist(name: str) -> bool:
-    # Try modern command
-    args = ["allowlist", "create", name, "-d", "allowlist created by pangolin-ip-rule-manager"]
-    rc, out, err = run_cscli(args)
-    if rc == 0:
-        print(f"[crowdsec] created allowlist '{name}' via: {' '.join(args)}")
-        return True
-    print(f"[crowdsec] failed to create allowlist '{name}'", rc, out, err)
-    return False
-
-
-def crowdsec_ensure_allowlist() -> None:
-    global _crowdsec_allowlist_ready
-    if not CROWDSEC_ENABLED:
+    # Pangolin cleanup is handled separately based on created_by_us; no generic expire here.
+    def expire_ip(self, ip: str) -> None:
         return
-    if _crowdsec_allowlist_ready:
-        return
-    exists = crowdsec_allowlist_exists(CROWDSEC_ALLOWLIST_NAME)
-    if not exists:
-        ok = crowdsec_create_allowlist(CROWDSEC_ALLOWLIST_NAME)
-        if not ok:
-            print(f"[crowdsec] WARNING: could not create allowlist '{CROWDSEC_ALLOWLIST_NAME}'. Commands may fail.")
-    _crowdsec_allowlist_ready = True
 
 
-def _parse_crowdsec_entries_from_json(text: str) -> set[str]:
-    try:
-        data = json.loads(text)
-    except Exception:
-        return set()
-    ips: set[str] = set()
-    # Possible structures: list[str], list[dict], dict with 'entries'/'ips'/'items'
-    items = None
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        for key in ("entries", "ips", "items", "members"):
-            if key in data and isinstance(data[key], (list, tuple)):
-                items = data[key]
-                break
-    if items is None:
-        return set()
-    for it in items:
-        if isinstance(it, str):
-            tok = it.strip()
-            try:
-                # accept single IP or CIDR; normalize to compressed ip (network -> network address as string)
-                if "/" in tok:
-                    net = ipaddress.ip_network(tok, strict=False)
-                    ips.add(str(net.network_address))
-                else:
-                    ips.add(str(ipaddress.ip_address(tok)))
-            except Exception:
-                continue
-        elif isinstance(it, dict):
-            for key in ("ip", "value", "cidr", "address"):
-                val = it.get(key)
-                if isinstance(val, str):
-                    try:
-                        if "/" in val:
-                            net = ipaddress.ip_network(val, strict=False)
-                            ips.add(str(net.network_address))
-                        else:
-                            ips.add(str(ipaddress.ip_address(val)))
-                    except Exception:
-                        pass
-    return ips
+class CrowdSecTarget(Target):
+    def ensure_ready(self) -> None:
+        crowdsec_ensure_allowlist()
+
+    def add_ip(self, ip: str) -> None:
+        crowdsec_add_ip(ip)
+
+    def expire_ip(self, ip: str) -> None:
+        crowdsec_remove_ip(ip)
 
 
-
-def _crowdsec_refresh_allowlist_ip_set() -> set[str]:
-    """Force refresh the cache by running 'cscli allowlist <name> list' or variants."""
-    if not CROWDSEC_ENABLED:
-        return set()
-    # try variants (prefer JSON)
-    ip_set: set[str] = set()
-
-    args = ["allowlist", "inspect", CROWDSEC_ALLOWLIST_NAME, "-o", "json"]
-
-    rc, out, err = run_cscli(args)
-    if rc == 0 and out:
-        parsed = _parse_crowdsec_entries_from_json(out)
-        if parsed:
-            ip_set = parsed
-
-    now_ts = time.time()
-    with state_lock:
-        crowdsec_cache["ts"] = now_ts
-        crowdsec_cache["ip_set"] = ip_set
-    return ip_set
+def make_pangolin_context() -> PangolinContext:
+    return PangolinContext(
+        url=PANGOLIN_URL,
+        token=PANGOLIN_TOKEN,
+        resource_ids=RESOURCE_IDS,
+        rule_priority=RULE_PRIORITY,
+        rules_cache_ttl_seconds=RULES_CACHE_TTL_SECONDS,
+        rules_cache=rules_cache,
+        state=state,
+        state_lock=state_lock,
+        save_state=save_state,
+        now_utc_iso=now_utc_iso,
+        http_json=http_json,
+    )
 
 
-def _get_crowdsec_ip_set_cached() -> set[str]:
-    if not CROWDSEC_ENABLED:
-        return set()
-    now_ts = time.time()
-    with state_lock:
-        ts = crowdsec_cache.get("ts", 0.0)
-        ip_set = crowdsec_cache.get("ip_set", set())
-        if ip_set and (now_ts - ts) < CROWDSEC_CACHE_TTL_SECONDS:
-            return set(ip_set)
-    # refresh if empty or expired
-    return _crowdsec_refresh_allowlist_ip_set()
-
-
-def _crowdsec_ip_known_or_refresh(ip: str) -> bool:
-    # Quick check against current cache
-    ip_set = _get_crowdsec_ip_set_cached()
-    if ip in ip_set:
-        return True
-    # Not known -> force refresh from cscli once
-    ip_set = _crowdsec_refresh_allowlist_ip_set()
-    return ip in ip_set
-
-
-def crowdsec_add_ip(ip: str) -> None:
-    if not CROWDSEC_ENABLED:
-        return
-    crowdsec_ensure_allowlist()
-    # If we already know this IP is present, skip calling cscli add
-    if _crowdsec_ip_known_or_refresh(ip):
-        print(f"[crowdsec] already present {ip} in allowlist '{CROWDSEC_ALLOWLIST_NAME}' (cache)")
-        return
-    args = ["allowlist", "add", CROWDSEC_ALLOWLIST_NAME, ip, "-d", "added on " + now_utc_iso() + " by pangolin-ip-rule-manager"]
-    rc, out, err = run_cscli(args)
-    if rc == 0:
-        print(f"[crowdsec] added {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
-        # update cache immediately
-        with state_lock:
-            s = crowdsec_cache.setdefault("ip_set", set())
-            s.add(ip)
-            if not crowdsec_cache.get("ts"):
-                crowdsec_cache["ts"] = time.time()
-        return
-    # Add failed: maybe it already existed; re-list once to confirm
-    refreshed = _crowdsec_refresh_allowlist_ip_set()
-    if ip in refreshed:
-        print(f"[crowdsec] add reported failure but IP already present {ip} in '{CROWDSEC_ALLOWLIST_NAME}'")
-        return
-    print(f"[crowdsec] WARNING: failed to add {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'", rc, out, err)
-
-
-def crowdsec_remove_ip(ip: str) -> None:
-    if not CROWDSEC_ENABLED:
-        return
-    # Only attempt removal if we know it's present; otherwise refresh once and re-check
-    present = ip in _get_crowdsec_ip_set_cached()
-    if not present:
-        present = ip in _crowdsec_refresh_allowlist_ip_set()
-    if not present:
-        # nothing to do
-        return
-    args = ["allowlist", "remove", CROWDSEC_ALLOWLIST_NAME, ip]
-    rc, out, err = run_cscli(args)
-    if rc == 0:
-        print(f"[crowdsec] removed {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
-        with state_lock:
-            s = crowdsec_cache.setdefault("ip_set", set())
-            if ip in s:
-                s.discard(ip)
-        return
-    print(f"[crowdsec] WARNING: failed to remove {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+# Register targets
+TARGETS: list[Target] = [PangolinTarget(make_pangolin_context)]
+if CROWDSEC_ENABLED:
+    TARGETS.append(CrowdSecTarget())
 
 
 def _get_ip_set_for_resource_cached(rid: int):
     """Return a set of IPs that currently have a rule for the resource.
     Uses a 1h TTL cache to avoid frequent GET calls."""
-    now = time.time()
-    with state_lock:
-        entry = rules_cache.get(rid)
-        if entry and (now - entry.get("ts", 0) < RULES_CACHE_TTL_SECONDS):
-            return entry.get("ip_set", set())
-    # Refresh from Pangolin
-    print(f"[pangolin] refreshing rules for resource {rid}")
-    rules_resp = http_json("GET", f"{PANGOLIN_URL}/v1/resource/{rid}/rules?limit=10000")
-    rules = rules_resp.get("data", {}).get("rules", [])
-    ip_set = set()
-    for r in rules:
-        if r.get("match") == "IP":
-            v = r.get("value")
-            if isinstance(v, str):
-                ip_set.add(v)
-    with state_lock:
-        rules_cache[rid] = {"ts": now, "ip_set": ip_set}
-    return ip_set
+    ctx = make_pangolin_context()
+    return pg_get_ip_set_for_resource_cached(ctx, rid)
 
 
 def ensure_ip_rule(ip: str) -> None:
-    if not PANGOLIN_TOKEN:
-        print("[warn] No PANGOLIN_TOKEN set; skipping Pangolin API calls.")
-        return
-    for rid in RESOURCE_IDS:
-        try:
-            # 1) check cached existence
-            ip_set = _get_ip_set_for_resource_cached(rid)
-            if ip in ip_set:
-                print(f"[pangolin] rule already exists for IP {ip} on resource {rid}")
-                # Track presence but not created_by_us
-                with state_lock:
-                    rec = state.setdefault(ip, {"last_seen": now_utc_iso(), "resources": {}})
-                    rec["last_seen"] = now_utc_iso()
-                    rec["resources"].setdefault(str(rid), {"created_by_us": False})
-                continue
-            # 2) create rule
-            payload = {
-                "action": "ACCEPT",
-                "match": "IP",
-                "value": ip,
-                "priority": RULE_PRIORITY,
-                "enabled": True,
-            }
-            _ = http_json("PUT", f"{PANGOLIN_URL}/v1/resource/{rid}/rule", payload)
-            print(f"[pangolin] created rule for IP {ip} on resource {rid}")
-            # Update cache to include newly created rule
-            with state_lock:
-                entry = rules_cache.get(rid)
-                if entry:
-                    entry.setdefault("ip_set", set()).add(ip)
-                    # keep original ts; it's fine for existence cache
-                else:
-                    rules_cache[rid] = {"ts": time.time(), "ip_set": {ip}}
-            # Update persistent state
-            with state_lock:
-                rec = state.setdefault(ip, {"last_seen": now_utc_iso(), "resources": {}})
-                rec["last_seen"] = now_utc_iso()
-                rec["resources"][str(rid)] = {"created_by_us": True}
-            save_state()
-        except Exception as e:
-            print(f"[pangolin] ensure rule failed for resource {rid}, ip {ip}: {e}")
+    ctx = make_pangolin_context()
+    pg_ensure_ip_rule(ctx, ip)
 
 
 # --------------------------
@@ -418,57 +228,36 @@ def ensure_ip_rule(ip: str) -> None:
 
 def add_ip_to_targets(ip: str) -> None:
     """Add/allow this IP across configured targets (Pangolin, CrowdSec, etc.)."""
-    # Pangolin (primary)
-    try:
-        ensure_ip_rule(ip)
-    except Exception as e:
-        print(f"[targets] pangolin ensure failed for {ip}: {e}")
-    # CrowdSec (optional)
-    try:
-        crowdsec_add_ip(ip)
-    except Exception as e:
-        print(f"[targets] crowdsec add failed for {ip}: {e}")
+    for t in TARGETS:
+        try:
+            t.add_ip(ip)
+        except Exception as e:
+            print(f"[targets] add failed for {ip} on {t.__class__.__name__}: {e}")
 
 
 def expire_ip_from_targets(ip: str) -> None:
     """Expire/remove this IP across optional targets when our retention hit."""
-    try:
-        crowdsec_remove_ip(ip)
-    except Exception as e:
-        print(f"[targets] crowdsec remove failed for {ip}: {e}")
+    for t in TARGETS:
+        try:
+            t.expire_ip(ip)
+        except Exception as e:
+            print(f"[targets] expire failed for {ip} on {t.__class__.__name__}: {e}")
 
 
 def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
-    """Returns True if a deletion was performed, False otherwise."""
-    try:
-        rules_resp = http_json(
-            "GET", f"{PANGOLIN_URL}/v1/resource/{rid}/rules?limit=10000"
-        )
-        rules = rules_resp.get("data", {}).get("rules", [])
-        to_delete = [r for r in rules if r.get("match") == "IP" and r.get("value") == ip]
-        deleted_any = False
-        for r in to_delete:
-            rule_id = r.get("ruleId")
-            if rule_id is None:
-                continue
-            try:
-                _ = http_json(
-                    "DELETE", f"{PANGOLIN_URL}/v1/resource/{rid}/rule/{rule_id}"
-                )
-                print(f"[pangolin] deleted rule {rule_id} for IP {ip} on resource {rid}")
-                deleted_any = True
-            except Exception as e:
-                print(f"[pangolin] delete failed for rule {rule_id} on {rid}: {e}")
-        return deleted_any
-    except Exception as e:
-        print(f"[pangolin] fetch rules (delete phase) failed for {rid}, ip {ip}: {e}")
-        return False
+    ctx = make_pangolin_context()
+    return pg_delete_ip_rule_if_created_by_us(ctx, ip, rid)
 
 
 def cleanup_old_ips():
     print("[cleanup] starting")
-    print("current ips allowed:" , str(state))
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=RETENTION_MINUTES)
+    # Avoid dumping the entire state (privacy/noise); log a summary count instead
+    with state_lock:
+        state_count = len(state)
+    print(f"[cleanup] current IPs in state: {state_count}")
+    # Use second-level precision to align with stored timestamps (now_utc_iso has no microseconds)
+    now_sec = datetime.now(timezone.utc).replace(microsecond=0)
+    cutoff = now_sec - timedelta(minutes=RETENTION_MINUTES)
     with state_lock:
         ips = list(state.keys())
     for ip in ips:
@@ -480,7 +269,8 @@ def cleanup_old_ips():
             last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")) if last_seen_str else None
         except Exception:
             last_seen = None
-        if not last_seen or last_seen > cutoff:
+        # Skip if record is missing timestamp or not yet expired
+        if not last_seen or last_seen >= cutoff:
             continue
         # Time to cleanup per resource if created_by_us
         changed = False
@@ -508,7 +298,7 @@ def cleanup_old_ips():
             print(f"[cleanup] crowdsec expire failed for {ip}: {e}")
         if changed:
             save_state()
-        print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
+            print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
     print("[cleanup] done")
 
 
@@ -521,81 +311,28 @@ def cleanup_loop():
         time.sleep(CLEANUP_INTERVAL_MINUTES*60)
 
 
-class BannerHandler(BaseHTTPRequestHandler):
-    server_version = "BannerServer/1.0"
-
-    def log_message(self, fmt, *args):
-        # Minimal console logging
-        print("[http]", self.address_string(), "-", fmt % args)
-
-    def _get_real_ip(self) -> str:
-        # precedence: X-Real-IP, X-Forwarded-For (first), fallback to client addr
-        xr = self.headers.get("X-Real-IP")
-        if xr:
-            return xr.strip()
-        xff = self.headers.get("X-Forwarded-For")
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0]
-
-    def do_GET(self):
-        ip = self._get_real_ip()
-        parsed_path = urlparse(self.path)
-        path = (parsed_path.path or "/")
-
-        remote_user = self.headers.get("Remote-User","")
-
-        # Log all request headers
-        print("New request from", ip, " user:", remote_user, "path:", path, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
-
-        # Enforce Pangolin custom header (mandatory)
-        actual = self.headers.get(EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY)
-        if actual is None or actual != EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE:
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"Forbidden: missing or invalid Pangolin custom header")
-            print(f"[error] Missing or invalid Pangolin custom header: {actual}")
-            return
+from image_request_handler import create_image_request_handler
 
 
-        lower_path = path.lower()
-        # Explicitly forbid root path even if header is correct
-        if path == "/":
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"Forbidden")
-            print(f"[error] Root path forbidden: {self.path}")
-            return
-        # Only serve PNG or GIF transparent images; other paths -> 404
-        is_png = lower_path.endswith(".png")
-        is_gif = lower_path.endswith(".gif")
-        if not (is_png or is_gif):
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not found")
-            print(f"[error] Invalid path (not .png/.gif): {self.path}")
-            return
+def _make_image_handler_context() -> dict:
+    return {
+        "expected_header_key": EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY,
+        "expected_header_value": EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE,
+        "state": state,
+        "state_lock": state_lock,
+        "now_utc_iso": now_utc_iso,
+        "save_state": save_state,
+        "add_ip_to_targets": add_ip_to_targets,
+        "banner_png": BANNER_PNG,
+        "banner_gif": BANNER_GIF,
+        "redact_headers_for_log": redact_headers_for_log,
+    }
 
-        # Update state and ensure rules
-        with state_lock:
-            rec = state.setdefault(ip, {"last_seen": now_utc_iso(), "resources": {}})
-            rec["last_seen"] = now_utc_iso()
-        save_state()
 
-        # Perform target updates synchronously (simple, small scale)
-        try:
-            add_ip_to_targets(ip)
-        except Exception as e:
-            print(f"[error] add_ip_to_targets failed for {ip}: {e}")
-
-        # Serve transparent image according to extension
-        body = BANNER_GIF if is_gif else BANNER_PNG
-        ctype = "image/gif" if is_gif else "image/png"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+# Expose the HTTP handler class (renamed from BannerHandler)
+ImageRequestHandler = create_image_request_handler(_make_image_handler_context())
+# Backward compatibility for external users/tests that still reference BannerHandler
+BannerHandler = ImageRequestHandler
 
 
 def self_check():
@@ -630,25 +367,8 @@ def self_check():
 
 
 def print_org_resources():
-    try:
-        url = f"{PANGOLIN_URL}/v1/org/{ORG_ID}/resources?limit=1000&offset=0"
-        resp = http_json("GET", url)
-        resources = (
-            resp.get("data", {}).get("resources")
-            if isinstance(resp, dict)
-            else []
-        ) or resp.get("resources", []) or []
-        print(f"[pangolin] These are the resources for org '{ORG_ID}'. Use the resourceId numbers for your configuration:")
-        if not resources:
-            print("  (no resources found or empty response)")
-            return
-        for r in resources:
-            name = r.get("name") or r.get("resourceName") or "(no-name)"
-            rid = r.get("resourceId") or r.get("id")
-            print(f"  - {name} (resourceId={rid})")
-    except Exception as e:
-        print(f"[pangolin] failed to list resources for org {ORG_ID}: {e}")
-        raise e
+    ctx = make_pangolin_context()
+    pg_list_org_resources(ctx, ORG_ID)
 
 
 def main():
@@ -657,18 +377,19 @@ def main():
     # Fetch and print resources for the configured org (helper for selecting resource IDs)
     print_org_resources()
 
-    # Ensure CrowdSec allowlist exists if enabled
-    try:
-        crowdsec_ensure_allowlist()
-    except Exception as e:
-        print(f"[crowdsec] ensure allowlist failed: {e}")
+    # Ensure targets are ready (e.g., create CrowdSec allowlist if enabled)
+    for t in TARGETS:
+        try:
+            t.ensure_ready()
+        except Exception as e:
+            print(f"[targets] ensure_ready failed for {t.__class__.__name__}: {e}")
 
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
     t.start()
 
     addr = ("0.0.0.0", LISTEN_PORT)
-    httpd = HTTPServer(addr, BannerHandler)
+    httpd = HTTPServer(addr, ImageRequestHandler)
     print(f"[start] Listening on {addr[0]}:{addr[1]} | resources={RESOURCE_IDS} | retention_minutes={RETENTION_MINUTES} | cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES}")
 
     httpd.serve_forever()
