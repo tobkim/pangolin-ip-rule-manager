@@ -540,11 +540,13 @@ class BannerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         ip = self._get_real_ip()
+        parsed_path = urlparse(self.path)
+        path = (parsed_path.path or "/")
 
         remote_user = self.headers.get("Remote-User","")
 
         # Log all request headers
-        print("New request from", ip, " user:", remote_user, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
+        print("New request from", ip, " user:", remote_user, "path:", path, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
 
         # Enforce Pangolin custom header (mandatory)
         actual = self.headers.get(EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY)
@@ -555,8 +557,7 @@ class BannerHandler(BaseHTTPRequestHandler):
             print(f"[error] Missing or invalid Pangolin custom header: {actual}")
             return
 
-        parsed = urlparse(self.path)
-        path = (parsed.path or "/")
+
         lower_path = path.lower()
         # Explicitly forbid root path even if header is correct
         if path == "/":
@@ -590,7 +591,6 @@ class BannerHandler(BaseHTTPRequestHandler):
         # Serve transparent image according to extension
         body = BANNER_GIF if is_gif else BANNER_PNG
         ctype = "image/gif" if is_gif else "image/png"
-        print(f"[http] Serving {ctype} for path '{path}' to IP {ip}")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
