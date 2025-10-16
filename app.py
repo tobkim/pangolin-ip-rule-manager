@@ -5,6 +5,7 @@ import threading
 import time
 import subprocess
 import shlex
+import ipaddress
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -28,6 +29,7 @@ CROWDSEC_CSCLI_BIN = os.getenv("CROWDSEC_CSCLI_BIN", "cscli").strip()
 # Optional: a command prefix to run cscli in a container, e.g. "docker exec crowdsec"
 CROWDSEC_CMD_PREFIX = os.getenv("CROWDSEC_CMD_PREFIX", "").strip()
 CROWDSEC_ALLOWLIST_NAME = os.getenv("CROWDSEC_ALLOWLIST_NAME", "pangolin-ip-rule-manager").strip()
+CROWDSEC_CACHE_TTL_SECONDS = int(os.getenv("CROWDSEC_CACHE_TTL_SECONDS", "3600"))  # cache TTL for CrowdSec allowlist entries (~1h)
 # Mandatory Pangolin custom header gate: both must be set and non-empty
 EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", "").strip()
 EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", "").strip()
@@ -54,6 +56,8 @@ rules_cache = {
 
 # CrowdSec runtime flags/caches
 _crowdsec_allowlist_ready = False
+# Cache of IPs currently in the CrowdSec allowlist (with TTL)
+crowdsec_cache = {"ts": 0.0, "ip_set": set()}
 
 
 def now_utc_iso() -> str:
@@ -198,14 +202,118 @@ def crowdsec_ensure_allowlist() -> None:
     _crowdsec_allowlist_ready = True
 
 
+def _parse_crowdsec_entries_from_json(text: str) -> set[str]:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return set()
+    ips: set[str] = set()
+    # Possible structures: list[str], list[dict], dict with 'entries'/'ips'/'items'
+    items = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for key in ("entries", "ips", "items", "members"):
+            if key in data and isinstance(data[key], (list, tuple)):
+                items = data[key]
+                break
+    if items is None:
+        return set()
+    for it in items:
+        if isinstance(it, str):
+            tok = it.strip()
+            try:
+                # accept single IP or CIDR; normalize to compressed ip (network -> network address as string)
+                if "/" in tok:
+                    net = ipaddress.ip_network(tok, strict=False)
+                    ips.add(str(net.network_address))
+                else:
+                    ips.add(str(ipaddress.ip_address(tok)))
+            except Exception:
+                continue
+        elif isinstance(it, dict):
+            for key in ("ip", "value", "cidr", "address"):
+                val = it.get(key)
+                if isinstance(val, str):
+                    try:
+                        if "/" in val:
+                            net = ipaddress.ip_network(val, strict=False)
+                            ips.add(str(net.network_address))
+                        else:
+                            ips.add(str(ipaddress.ip_address(val)))
+                    except Exception:
+                        pass
+    return ips
+
+
+
+def _crowdsec_refresh_allowlist_ip_set() -> set[str]:
+    """Force refresh the cache by running 'cscli allowlist <name> list' or variants."""
+    if not CROWDSEC_ENABLED:
+        return set()
+    # try variants (prefer JSON)
+
+    args = ["allowlist", CROWDSEC_ALLOWLIST_NAME, "list", "-o", "json"]
+
+    rc, out, err = run_cscli(args)
+    parsed = _parse_crowdsec_entries_from_json(out)
+
+    if parsed:
+        ip_set = parsed
+
+    now_ts = time.time()
+    with state_lock:
+        crowdsec_cache["ts"] = now_ts
+        crowdsec_cache["ip_set"] = ip_set
+    return ip_set
+
+
+def _get_crowdsec_ip_set_cached() -> set[str]:
+    if not CROWDSEC_ENABLED:
+        return set()
+    now_ts = time.time()
+    with state_lock:
+        ts = crowdsec_cache.get("ts", 0.0)
+        ip_set = crowdsec_cache.get("ip_set", set())
+        if ip_set and (now_ts - ts) < CROWDSEC_CACHE_TTL_SECONDS:
+            return set(ip_set)
+    # refresh if empty or expired
+    return _crowdsec_refresh_allowlist_ip_set()
+
+
+def _crowdsec_ip_known_or_refresh(ip: str) -> bool:
+    # Quick check against current cache
+    ip_set = _get_crowdsec_ip_set_cached()
+    if ip in ip_set:
+        return True
+    # Not known -> force refresh from cscli once
+    ip_set = _crowdsec_refresh_allowlist_ip_set()
+    return ip in ip_set
+
+
 def crowdsec_add_ip(ip: str) -> None:
     if not CROWDSEC_ENABLED:
         return
     crowdsec_ensure_allowlist()
+    # If we already know this IP is present, skip calling cscli add
+    if _crowdsec_ip_known_or_refresh(ip):
+        print(f"[crowdsec] already present {ip} in allowlist '{CROWDSEC_ALLOWLIST_NAME}' (cache)")
+        return
     args = ["allowlist", "add", CROWDSEC_ALLOWLIST_NAME, ip, "-d", "added on " + now_utc_iso() + " by pangolin-ip-rule-manager"]
     rc, out, err = run_cscli(args)
     if rc == 0:
         print(f"[crowdsec] added {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        # update cache immediately
+        with state_lock:
+            s = crowdsec_cache.setdefault("ip_set", set())
+            s.add(ip)
+            if not crowdsec_cache.get("ts"):
+                crowdsec_cache["ts"] = time.time()
+        return
+    # Add failed: maybe it already existed; re-list once to confirm
+    refreshed = _crowdsec_refresh_allowlist_ip_set()
+    if ip in refreshed:
+        print(f"[crowdsec] add reported failure but IP already present {ip} in '{CROWDSEC_ALLOWLIST_NAME}'")
         return
     print(f"[crowdsec] WARNING: failed to add {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'", rc, out, err)
 
@@ -213,10 +321,21 @@ def crowdsec_add_ip(ip: str) -> None:
 def crowdsec_remove_ip(ip: str) -> None:
     if not CROWDSEC_ENABLED:
         return
+    # Only attempt removal if we know it's present; otherwise refresh once and re-check
+    present = ip in _get_crowdsec_ip_set_cached()
+    if not present:
+        present = ip in _crowdsec_refresh_allowlist_ip_set()
+    if not present:
+        # nothing to do
+        return
     args = ["allowlist", "remove", CROWDSEC_ALLOWLIST_NAME, ip]
     rc, out, err = run_cscli(args)
     if rc == 0:
         print(f"[crowdsec] removed {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        with state_lock:
+            s = crowdsec_cache.setdefault("ip_set", set())
+            if ip in s:
+                s.discard(ip)
         return
     print(f"[crowdsec] WARNING: failed to remove {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
 
