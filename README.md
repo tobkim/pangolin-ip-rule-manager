@@ -17,18 +17,34 @@ This service serves a 1×1 transparent image at any path ending with .png or .gi
 
 ---
 
-## Key Properties
-- Extremely small and simple: Python stdlib only, no external dependencies
-- Image endpoints: any path ending with .png or .gif returns a 1×1 transparent image (PNG or GIF). Requests to the root path '/' return 403.
-- Security enforcement:
-  - Mandatory custom header (see EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY/EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE) must be present on every request
-- IP extraction from `X-Real-IP`, then `X-Forwarded-For`, then socket address
-- Pangolin API integration: GET current rules, PUT to add, DELETE to remove
-- Persistent state: JSON file (default at `/data/state.json`, persisted via a Docker volume in the provided compose file)
-- Background cleanup thread removes stale rules created by this service
-- Optional CrowdSec integration: add/remove IPs from a named CrowdSec allowlist via `cscli` (when enabled)
+
+## Run with Docker Compose (recommended)
+1) Clone this repository and change into the directory
+
+```bash
+git clone https://github.com/tobkim/pangolin-ip-rule-manager.git
+cd pangolin-ip-rule-manager
+```
+
+2) Copy config.env.sample to config.env and update the values.
+  - PANGOLIN_URL: Your Pangolin API base URL
+  - ORG_ID: Your Pangolin organization ID (string)
+  - PANGOLIN_TOKEN: API token with the required permissions (see below)
+  - RESOURCE_IDS: Comma-separated list of resource IDs to manage (e.g., 2,7,12). The available resource ids cannot be seen anymore in the newer pangolin versions. They are listed in the logs at the start of the container to help you out.
+  - Crowdsec Integration: Check the config.env.sample
+
+3) Start the service
+
+```bash
+docker compose up -d
+```
+
+4) configure a new resource in Pangolin and point it to this container, e.g. a subdomain checkin.yourdomain.com 
+
+5) access https://checkin.yourdomain.com/checkin.png (or /whatever_as_long_as_its_png_or.gif). Your IP should now be in the list of allowed IPs.
 
 ---
+
 
 ## Configuration (environment variables)
 - `PANGOLIN_URL`: Base URL of Pangolin API (default: `https://api.url.of.your.pangolin.instance`)
@@ -63,31 +79,20 @@ Notes:
 
 ---
 
-## Run with Docker Compose (recommended)
-1) Clone this repository and change into the directory
 
-```bash
-git clone https://github.com/tobkim/pangolin-ip-rule-manager.git
-cd pangolin-ip-rule-manager
-```
-
-2) Copy config.env.sample to config.env and update the values.
-  - PANGOLIN_URL: Your Pangolin API base URL
-  - ORG_ID: Your Pangolin organization ID (string)
-  - PANGOLIN_TOKEN: API token with the required permissions (see below)
-  - RESOURCE_IDS: Comma-separated list of resource IDs to manage (e.g., 2,7,12). The available resource ids cannot be seen anymore in the newer pangolin versions. They are listed in the logs at the start of the container to help you out.
-
-3) Start the service
-
-```bash
-docker compose up -d
-```
-
-4) configure a new resource in Pangolin and point it to this container, e.g. a subdomain checkin.yourdomain.com 
-
-5) access https://checkin.yourdomain.com/checkin.png (or whatever_as_long_as_its_png_or.gif). Your IP should now be in the list of allowed IPs.
+## Key Properties
+- Extremely small and simple: Python stdlib only, no external dependencies
+- Image endpoints: any path ending with .png or .gif returns a 1×1 transparent image (PNG or GIF). Requests to the root path '/' return 403.
+- Security enforcement:
+  - Mandatory custom header (see EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY/EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE) must be present on every request
+- IP extraction from `X-Real-IP`, then `X-Forwarded-For`, then socket address
+- Pangolin API integration: GET current rules, PUT to add, DELETE to remove
+- Persistent state: JSON file (default at `/data/state.json`, persisted via a Docker volume in the provided compose file)
+- Background cleanup thread removes stale rules created by this service
+- Optional CrowdSec integration: add/remove IPs from a named CrowdSec allowlist via `cscli` (when enabled)
 
 ---
+
 
 ---
 
@@ -114,8 +119,6 @@ Make sure the API token you configure has the following minimal permissions:
 - Ability to list resources in the organization (read-only)
 - Ability to list existing access rules for the specified resources
 - Ability to create and delete IP-based access rules for those resources
-
-If your Pangolin setup allows scoping tokens to specific resources, restrict the token to only the `RESOURCE_IDS` you will manage.
 
 The following screenshot shows the needed permissions to select:
 
