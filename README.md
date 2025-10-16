@@ -7,25 +7,26 @@ Tested with Pangolin v1.10.3.
 ---
 
 ## Important Warning
-- You are responsible for securing access to this service via Pangolin (and/or your reverse proxy). Do NOT expose it publicly without strict Pangolin ACLs limiting who can reach `/banner.png`.
+- You are responsible for securing access to this service via Pangolin (and/or your reverse proxy). Do NOT expose it publicly without strict Pangolin ACLs limiting who can reach the image endpoints (e.g., /checkin.png).
 - Keep your `PANGOLIN_TOKEN` secret and rotate it periodically.
 
 ---
 
 ## Overview
-This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 transparent PNG. Each request is treated as a heartbeat from the client's IP address, prompting rule creation (if needed) in Pangolin for configured resources. A background task cleans up rules created by this service if the IP hasn't been seen for a configurable period.
+This service serves a 1×1 transparent image at any path ending with .png or .gif. Each request is treated as a heartbeat from the client's IP address, prompting rule creation (if needed) in Pangolin for configured resources. A background task cleans up rules created by this service if the IP hasn't been seen for a configurable period.
 
 ---
 
 ## Key Properties
 - Extremely small and simple: Python stdlib only, no external dependencies
-- Single endpoint: `GET /banner.png` returns a 1×1 transparent PNG
+- Image endpoints: any path ending with .png or .gif returns a 1×1 transparent image (PNG or GIF). Requests to the root path '/' return 403.
 - Security enforcement:
   - Mandatory custom header (see EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY/EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE) must be present on every request
 - IP extraction from `X-Real-IP`, then `X-Forwarded-For`, then socket address
 - Pangolin API integration: GET current rules, PUT to add, DELETE to remove
 - Persistent state: JSON file (default at `/data/state.json`, persisted via a Docker volume in the provided compose file)
 - Background cleanup thread removes stale rules created by this service
+- Optional CrowdSec integration: add/remove IPs from a named CrowdSec allowlist via `cscli` (when enabled)
 
 ---
 
@@ -43,6 +44,22 @@ This service exposes a single endpoint, `GET /banner.png`, returning a 1×1 tran
 - `RULE_PRIORITY`: Rule priority when creating rules (default: `0`)
 - `RULES_CACHE_TTL_SECONDS`: Seconds to cache rule-existence checks per resource (default: `3600`)
 
+### Optional: CrowdSec integration (allowlist)
+- `CROWDSEC_ENABLED`: Set to `true` to enable CrowdSec integration (default: `false`).
+- `CROWDSEC_ALLOWLIST_NAME`: Name of the CrowdSec allowlist to manage (default: `pangolin-ip-rule-manager`). At startup, the tool checks if it exists and creates it via `cscli` if missing.
+- `CROWDSEC_CSCLI_BIN`: Path/name of the `cscli` binary (default: `cscli`).
+- `CROWDSEC_CMD_PREFIX`: Optional command prefix to run `cscli` (e.g., `docker exec crowdsec`). Useful if CrowdSec runs in a container.
+- `CROWDSEC_CACHE_TTL_SECONDS`: Seconds to cache membership checks for the named allowlist (default: `3600`). If an IP is not in the cache, the service first verifies with `cscli allowlist <name> list` before adding/removing.
+
+Behavior when enabled:
+- On startup, ensure the named allowlist exists (create if needed).
+- On each successful `/banner.png` request, also add the IP to the allowlist.
+- When an IP expires per `RETENTION_MINUTES`, remove it from the allowlist during cleanup.
+
+Notes:
+- This uses `cscli` on the same Docker host. If CrowdSec runs in a container, ensure this service can run `docker exec crowdsec cscli ...` (e.g., by mounting the Docker socket or running on the host).
+- CrowdSec allowlist membership is cached to avoid running commands on every request. If an IP isn't in the cache, the service first verifies the current contents via `cscli allowlist <name> list` before attempting add/remove.
+- Commands are attempted across common `cscli` versions; warnings are logged if commands are unavailable.
 
 ---
 
@@ -68,7 +85,7 @@ docker compose up -d
 
 4) configure a new resource in Pangolin and point it to this container, e.g. a subdomain checkin.yourdomain.com 
 
-5) access https://checkin.yourdomain.com/banner.png. Your IP should now be in the list of allowed IPs.
+5) access https://checkin.yourdomain.com/checkin.png (or whatever_as_long_as_its_png_or.gif). Your IP should now be in the list of allowed IPs.
 
 ---
 
@@ -81,7 +98,7 @@ docker compose up -d
 - On each successful request, the real IP is determined and this service:
   - Updates `last_seen` for that IP in the state file
   - Checks Pangolin rules for each `resourceId` and creates one if missing (rule-existence checks are cached per resource for about 1 hour, configurable)
-  - Serves a tiny PNG image
+  - Serves a tiny transparent image (PNG or GIF) depending on the requested file extension
 - A background task periodically deletes rules for IPs that this service created once they have not been seen for `RETENTION_MINUTES` minutes.
 
 ---
@@ -120,7 +137,7 @@ body::after {
   width: 1px;
   height: 1px;
   pointer-events: none;
-  background-image: url("https://your-pangolin-ip-rule-manager-domain.com/banner.png");
+  background-image: url("https://your-pangolin-ip-rule-manager-domain.com/jellyfin-checkin.png");
   background-repeat: no-repeat;
 }
 ```

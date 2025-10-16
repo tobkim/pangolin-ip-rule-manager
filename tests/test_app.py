@@ -46,6 +46,11 @@ def app_module(monkeypatch, temp_state_file):
         app = importlib.reload(_app)
     else:
         import app  # type: ignore
+    # As a safety for client header construction in tests, ensure these are non-empty strings
+    if not getattr(app, "EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", ""):
+        app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY = "X-Test-Key"
+    if not getattr(app, "EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", ""):
+        app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE = "v123"
     # Reset runtime state
     with app.state_lock:
         app.state.clear()
@@ -67,7 +72,7 @@ def test_banner_serves_png_and_updates_state(app_module):
             # Remote-User is optional; include to ensure logging path works
             "Remote-User": "alice",
         }
-        conn.request("GET", "/banner.png", headers=headers)
+        conn.request("GET", "/anything-can-work-123.png", headers=headers)
         resp = conn.getresponse()
         data = resp.read()
         assert resp.status == 200
@@ -105,11 +110,19 @@ def test_security_header_enforced(monkeypatch, temp_state_file):
         # With correct custom header -> 200
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
-        conn.request("GET", "/banner.png", headers=headers)
+        conn.request("GET", "/some-file.png", headers=headers)
         resp = conn.getresponse()
         data = resp.read()
         assert resp.status == 200
         assert data == app.BANNER_PNG
+
+        # Root path with correct header -> 403
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", "/", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 403
 
 
 def test_rules_cache_uses_cache(monkeypatch, app_module):
@@ -186,3 +199,49 @@ def test_security_header_misconfigured_only_value(monkeypatch, temp_state_file):
     import app as _app
     with pytest.raises(RuntimeError):
         importlib.reload(_app)
+
+
+
+def test_gif_serves_gif_and_updates_state(app_module):
+    app = app_module
+
+    test_ip = "6.7.8.9"
+
+    with start_server(app.BannerHandler) as (httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {
+            "X-Real-IP": test_ip,
+            app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE,
+        }
+        conn.request("GET", "/beacon.gif", headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        assert resp.status == 200
+        assert data == app.BANNER_GIF
+
+    # state should have been updated for the real ip
+    with app.state_lock:
+        assert test_ip in app.state
+
+
+def test_invalid_paths_denied(app_module):
+    app = app_module
+
+    with start_server(app.BannerHandler) as (httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {
+            app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE,
+        }
+
+        # Test root path
+        conn.request("GET", "/", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 403
+
+        # Test path without file extension
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/some-random-path", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 404

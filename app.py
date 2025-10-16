@@ -3,6 +3,9 @@ import json
 import os
 import threading
 import time
+import subprocess
+import shlex
+import ipaddress
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -20,6 +23,13 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60"))  # default 1 hour in minutes
 RULE_PRIORITY = int(os.getenv("RULE_PRIORITY", "0"))
 RULES_CACHE_TTL_SECONDS = int(os.getenv("RULES_CACHE_TTL_SECONDS", "3600"))  # cache for existence checks (~1h)
+# CrowdSec optional integration via cscli
+CROWDSEC_ENABLED = os.getenv("CROWDSEC_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+CROWDSEC_CSCLI_BIN = os.getenv("CROWDSEC_CSCLI_BIN", "cscli").strip()
+# Optional: a command prefix to run cscli in a container, e.g. "docker exec crowdsec"
+CROWDSEC_CMD_PREFIX = os.getenv("CROWDSEC_CMD_PREFIX", "").strip()
+CROWDSEC_ALLOWLIST_NAME = os.getenv("CROWDSEC_ALLOWLIST_NAME", "pangolin-ip-rule-manager").strip()
+CROWDSEC_CACHE_TTL_SECONDS = int(os.getenv("CROWDSEC_CACHE_TTL_SECONDS", "3600"))  # cache TTL for CrowdSec allowlist entries (~1h)
 # Mandatory Pangolin custom header gate: both must be set and non-empty
 EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", "").strip()
 EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", "").strip()
@@ -29,6 +39,10 @@ if not EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY or not EXPECTED_PANGOLIN_CUSTOM_HEADE
 # Minimal 1x1 PNG (transparent) as bytes
 BANNER_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+# Minimal 1x1 GIF (transparent) as bytes
+BANNER_GIF = base64.b64decode(
+    "R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw=="
 )
 
 state_lock = threading.Lock()
@@ -43,6 +57,11 @@ state = {
 rules_cache = {
     # rid: {"ts": epoch_seconds, "ip_set": set([...])}
 }
+
+# CrowdSec runtime flags/caches
+_crowdsec_allowlist_ready = False
+# Cache of IPs currently in the CrowdSec allowlist (with TTL)
+crowdsec_cache = {"ts": 0.0, "ip_set": set()}
 
 
 def now_utc_iso() -> str:
@@ -98,6 +117,232 @@ def http_json(method: str, url: str, body: dict | None = None) -> dict:
         raise RuntimeError(f"HTTP {e.code} {e.reason}: {err}")
     except URLError as e:
         raise RuntimeError(f"Network error: {e}")
+
+
+# --------------------------
+# CrowdSec integration
+# --------------------------
+
+def _build_cscli_cmd(args: list[str]) -> list[str]:
+    parts: list[str] = []
+    if CROWDSEC_CMD_PREFIX:
+        try:
+            parts.extend(shlex.split(CROWDSEC_CMD_PREFIX))
+        except Exception:
+            parts.append(CROWDSEC_CMD_PREFIX)
+    parts.append(CROWDSEC_CSCLI_BIN)
+    parts.extend(args)
+    return parts
+
+
+def run_cscli(args: list[str]) -> tuple[int, str, str]:
+    """Run cscli command. Returns (returncode, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            _build_cscli_cmd(args),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", "cscli not found"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def crowdsec_allowlist_exists(name: str) -> bool:
+    # Prefer JSON output if available
+    rc, out, err = run_cscli(["allowlist", "list", "-o", "json"])  # newest cscli
+    if rc == 0 and out:
+        try:
+            data = json.loads(out)
+            # expect list of allowlists with name fields
+            if isinstance(data, list):
+                return any((isinstance(x, dict) and x.get("name") == name) for x in data)
+        except Exception:
+            pass
+    else:
+        # try legacy plural command
+        rc2, out2, _ = run_cscli(["allowlists", "list", "-o", "json"])  # legacy
+        if rc2 == 0 and out2:
+            try:
+                data = json.loads(out2)
+                if isinstance(data, list):
+                    return any((isinstance(x, dict) and x.get("name") == name) for x in data)
+            except Exception:
+                pass
+    # Fallback: plain text search
+    for args in (["allowlist", "list"], ["allowlists", "list"]):
+        rc3, out3, _ = run_cscli(args)
+        if rc3 == 0 and out3:
+            if name in out3:
+                return True
+    return False
+
+
+def crowdsec_create_allowlist(name: str) -> bool:
+    # Try modern command
+    args = ["allowlist", "create", name, "-d", "allowlist created by pangolin-ip-rule-manager"]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] created allowlist '{name}' via: {' '.join(args)}")
+        return True
+    print(f"[crowdsec] failed to create allowlist '{name}'", rc, out, err)
+    return False
+
+
+def crowdsec_ensure_allowlist() -> None:
+    global _crowdsec_allowlist_ready
+    if not CROWDSEC_ENABLED:
+        return
+    if _crowdsec_allowlist_ready:
+        return
+    exists = crowdsec_allowlist_exists(CROWDSEC_ALLOWLIST_NAME)
+    if not exists:
+        ok = crowdsec_create_allowlist(CROWDSEC_ALLOWLIST_NAME)
+        if not ok:
+            print(f"[crowdsec] WARNING: could not create allowlist '{CROWDSEC_ALLOWLIST_NAME}'. Commands may fail.")
+    _crowdsec_allowlist_ready = True
+
+
+def _parse_crowdsec_entries_from_json(text: str) -> set[str]:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return set()
+    ips: set[str] = set()
+    # Possible structures: list[str], list[dict], dict with 'entries'/'ips'/'items'
+    items = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for key in ("entries", "ips", "items", "members"):
+            if key in data and isinstance(data[key], (list, tuple)):
+                items = data[key]
+                break
+    if items is None:
+        return set()
+    for it in items:
+        if isinstance(it, str):
+            tok = it.strip()
+            try:
+                # accept single IP or CIDR; normalize to compressed ip (network -> network address as string)
+                if "/" in tok:
+                    net = ipaddress.ip_network(tok, strict=False)
+                    ips.add(str(net.network_address))
+                else:
+                    ips.add(str(ipaddress.ip_address(tok)))
+            except Exception:
+                continue
+        elif isinstance(it, dict):
+            for key in ("ip", "value", "cidr", "address"):
+                val = it.get(key)
+                if isinstance(val, str):
+                    try:
+                        if "/" in val:
+                            net = ipaddress.ip_network(val, strict=False)
+                            ips.add(str(net.network_address))
+                        else:
+                            ips.add(str(ipaddress.ip_address(val)))
+                    except Exception:
+                        pass
+    return ips
+
+
+
+def _crowdsec_refresh_allowlist_ip_set() -> set[str]:
+    """Force refresh the cache by running 'cscli allowlist <name> list' or variants."""
+    if not CROWDSEC_ENABLED:
+        return set()
+    # try variants (prefer JSON)
+    ip_set: set[str] = set()
+
+    args = ["allowlist", "inspect", CROWDSEC_ALLOWLIST_NAME, "-o", "json"]
+
+    rc, out, err = run_cscli(args)
+    if rc == 0 and out:
+        parsed = _parse_crowdsec_entries_from_json(out)
+        if parsed:
+            ip_set = parsed
+
+    now_ts = time.time()
+    with state_lock:
+        crowdsec_cache["ts"] = now_ts
+        crowdsec_cache["ip_set"] = ip_set
+    return ip_set
+
+
+def _get_crowdsec_ip_set_cached() -> set[str]:
+    if not CROWDSEC_ENABLED:
+        return set()
+    now_ts = time.time()
+    with state_lock:
+        ts = crowdsec_cache.get("ts", 0.0)
+        ip_set = crowdsec_cache.get("ip_set", set())
+        if ip_set and (now_ts - ts) < CROWDSEC_CACHE_TTL_SECONDS:
+            return set(ip_set)
+    # refresh if empty or expired
+    return _crowdsec_refresh_allowlist_ip_set()
+
+
+def _crowdsec_ip_known_or_refresh(ip: str) -> bool:
+    # Quick check against current cache
+    ip_set = _get_crowdsec_ip_set_cached()
+    if ip in ip_set:
+        return True
+    # Not known -> force refresh from cscli once
+    ip_set = _crowdsec_refresh_allowlist_ip_set()
+    return ip in ip_set
+
+
+def crowdsec_add_ip(ip: str) -> None:
+    if not CROWDSEC_ENABLED:
+        return
+    crowdsec_ensure_allowlist()
+    # If we already know this IP is present, skip calling cscli add
+    if _crowdsec_ip_known_or_refresh(ip):
+        print(f"[crowdsec] already present {ip} in allowlist '{CROWDSEC_ALLOWLIST_NAME}' (cache)")
+        return
+    args = ["allowlist", "add", CROWDSEC_ALLOWLIST_NAME, ip, "-d", "added on " + now_utc_iso() + " by pangolin-ip-rule-manager"]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] added {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        # update cache immediately
+        with state_lock:
+            s = crowdsec_cache.setdefault("ip_set", set())
+            s.add(ip)
+            if not crowdsec_cache.get("ts"):
+                crowdsec_cache["ts"] = time.time()
+        return
+    # Add failed: maybe it already existed; re-list once to confirm
+    refreshed = _crowdsec_refresh_allowlist_ip_set()
+    if ip in refreshed:
+        print(f"[crowdsec] add reported failure but IP already present {ip} in '{CROWDSEC_ALLOWLIST_NAME}'")
+        return
+    print(f"[crowdsec] WARNING: failed to add {ip} to allowlist '{CROWDSEC_ALLOWLIST_NAME}'", rc, out, err)
+
+
+def crowdsec_remove_ip(ip: str) -> None:
+    if not CROWDSEC_ENABLED:
+        return
+    # Only attempt removal if we know it's present; otherwise refresh once and re-check
+    present = ip in _get_crowdsec_ip_set_cached()
+    if not present:
+        present = ip in _crowdsec_refresh_allowlist_ip_set()
+    if not present:
+        # nothing to do
+        return
+    args = ["allowlist", "remove", CROWDSEC_ALLOWLIST_NAME, ip]
+    rc, out, err = run_cscli(args)
+    if rc == 0:
+        print(f"[crowdsec] removed {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
+        with state_lock:
+            s = crowdsec_cache.setdefault("ip_set", set())
+            if ip in s:
+                s.discard(ip)
+        return
+    print(f"[crowdsec] WARNING: failed to remove {ip} from allowlist '{CROWDSEC_ALLOWLIST_NAME}'")
 
 
 def _get_ip_set_for_resource_cached(rid: int):
@@ -167,6 +412,32 @@ def ensure_ip_rule(ip: str) -> None:
             print(f"[pangolin] ensure rule failed for resource {rid}, ip {ip}: {e}")
 
 
+# --------------------------
+# Target aggregation (extensibility point)
+# --------------------------
+
+def add_ip_to_targets(ip: str) -> None:
+    """Add/allow this IP across configured targets (Pangolin, CrowdSec, etc.)."""
+    # Pangolin (primary)
+    try:
+        ensure_ip_rule(ip)
+    except Exception as e:
+        print(f"[targets] pangolin ensure failed for {ip}: {e}")
+    # CrowdSec (optional)
+    try:
+        crowdsec_add_ip(ip)
+    except Exception as e:
+        print(f"[targets] crowdsec add failed for {ip}: {e}")
+
+
+def expire_ip_from_targets(ip: str) -> None:
+    """Expire/remove this IP across optional targets when our retention hit."""
+    try:
+        crowdsec_remove_ip(ip)
+    except Exception as e:
+        print(f"[targets] crowdsec remove failed for {ip}: {e}")
+
+
 def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
     """Returns True if a deletion was performed, False otherwise."""
     try:
@@ -230,6 +501,11 @@ def cleanup_old_ips():
             if rec3 and not rec3.get("resources"):
                 state.pop(ip, None)
                 changed = True
+        # Always attempt CrowdSec expiration for expired IPs (idempotent)
+        try:
+            expire_ip_from_targets(ip)
+        except Exception as e:
+            print(f"[cleanup] crowdsec expire failed for {ip}: {e}")
         if changed:
             save_state()
         print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
@@ -264,11 +540,13 @@ class BannerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         ip = self._get_real_ip()
+        parsed_path = urlparse(self.path)
+        path = (parsed_path.path or "/")
 
         remote_user = self.headers.get("Remote-User","")
 
         # Log all request headers
-        print("New request from", ip, " user:", remote_user, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
+        print("New request from", ip, " user:", remote_user, "path:", path, "Headers: ", json.dumps({k: v for k, v in self.headers.items()}))
 
         # Enforce Pangolin custom header (mandatory)
         actual = self.headers.get(EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY)
@@ -279,12 +557,23 @@ class BannerHandler(BaseHTTPRequestHandler):
             print(f"[error] Missing or invalid Pangolin custom header: {actual}")
             return
 
-        parsed = urlparse(self.path)
-        if parsed.path != "/banner.png":
+
+        lower_path = path.lower()
+        # Explicitly forbid root path even if header is correct
+        if path == "/":
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden")
+            print(f"[error] Root path forbidden: {self.path}")
+            return
+        # Only serve PNG or GIF transparent images; other paths -> 404
+        is_png = lower_path.endswith(".png")
+        is_gif = lower_path.endswith(".gif")
+        if not (is_png or is_gif):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found")
-            print(f"[error] Invalid path: {self.path}")
+            print(f"[error] Invalid path (not .png/.gif): {self.path}")
             return
 
         # Update state and ensure rules
@@ -293,18 +582,20 @@ class BannerHandler(BaseHTTPRequestHandler):
             rec["last_seen"] = now_utc_iso()
         save_state()
 
-        # Perform Pangolin call synchronously (simple, small scale)
+        # Perform target updates synchronously (simple, small scale)
         try:
-            ensure_ip_rule(ip)
+            add_ip_to_targets(ip)
         except Exception as e:
-            print(f"[error] ensure_ip_rule failed for {ip}: {e}")
+            print(f"[error] add_ip_to_targets failed for {ip}: {e}")
 
-        # Serve PNG
+        # Serve transparent image according to extension
+        body = BANNER_GIF if is_gif else BANNER_PNG
+        ctype = "image/gif" if is_gif else "image/png"
         self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(BANNER_PNG)))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(BANNER_PNG)
+        self.wfile.write(body)
 
 
 def self_check():
@@ -325,10 +616,16 @@ def self_check():
     if not RESOURCE_IDS:
         print("[warn] RESOURCE_IDS is empty; no resources will be managed.")
 
+    cs_status = (
+        f"enabled name='{CROWDSEC_ALLOWLIST_NAME}' bin='{CROWDSEC_CSCLI_BIN}' prefix='{CROWDSEC_CMD_PREFIX}'"
+        if CROWDSEC_ENABLED else "disabled"
+    )
+
     print(
         f"[self-check] OK. listen_port={LISTEN_PORT} state_file={STATE_FILE} "
         f"resources={RESOURCE_IDS} retention_minutes={RETENTION_MINUTES} "
-        f"cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES} rule_priority={RULE_PRIORITY}"
+        f"cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES} rule_priority={RULE_PRIORITY} "
+        f"crowdsec={cs_status}"
     )
 
 
@@ -359,6 +656,12 @@ def main():
     load_state()
     # Fetch and print resources for the configured org (helper for selecting resource IDs)
     print_org_resources()
+
+    # Ensure CrowdSec allowlist exists if enabled
+    try:
+        crowdsec_ensure_allowlist()
+    except Exception as e:
+        print(f"[crowdsec] ensure allowlist failed: {e}")
 
     # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
