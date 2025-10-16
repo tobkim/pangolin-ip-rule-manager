@@ -255,7 +255,9 @@ def cleanup_old_ips():
     with state_lock:
         state_count = len(state)
     print(f"[cleanup] current IPs in state: {state_count}")
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=RETENTION_MINUTES)
+    # Use second-level precision to align with stored timestamps (now_utc_iso has no microseconds)
+    now_sec = datetime.now(timezone.utc).replace(microsecond=0)
+    cutoff = now_sec - timedelta(minutes=RETENTION_MINUTES)
     with state_lock:
         ips = list(state.keys())
     for ip in ips:
@@ -267,7 +269,8 @@ def cleanup_old_ips():
             last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")) if last_seen_str else None
         except Exception:
             last_seen = None
-        if not last_seen or last_seen > cutoff:
+        # Skip if record is missing timestamp or not yet expired
+        if not last_seen or last_seen >= cutoff:
             continue
         # Time to cleanup per resource if created_by_us
         changed = False
@@ -295,7 +298,7 @@ def cleanup_old_ips():
             print(f"[cleanup] crowdsec expire failed for {ip}: {e}")
         if changed:
             save_state()
-        print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
+            print(f"[cleanup] removed {ip} (last_seen={last_seen_str})")
     print("[cleanup] done")
 
 

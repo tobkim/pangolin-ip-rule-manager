@@ -245,3 +245,105 @@ def test_invalid_paths_denied(app_module):
         resp = conn.getresponse()
         _ = resp.read()
         assert resp.status == 404
+
+
+
+def test_cleanup_longer_scenario_mixed_outcomes(monkeypatch, app_module):
+    app = app_module
+
+    # Expire old IPs, keep one fresh
+    monkeypatch.setattr(app, "RETENTION_MINUTES", 0)
+
+    ip_removed = "1.1.1.1"             # created_by_us=True, delete succeeds -> fully removed
+    ip_delete_failed = "2.2.2.2"       # created_by_us=True, delete fails -> remains in state
+    ip_not_created = "3.3.3.3"         # created_by_us=False -> never attempted, remains
+    ip_fresh = "4.4.4.4"               # not expired -> remains
+
+    with app.state_lock:
+        app.state[ip_removed] = {
+            "last_seen": "2000-01-01T00:00:00Z",
+            "resources": {"5": {"created_by_us": True}},
+        }
+        app.state[ip_delete_failed] = {
+            "last_seen": "2000-01-01T00:00:00Z",
+            "resources": {"5": {"created_by_us": True}},
+        }
+        app.state[ip_not_created] = {
+            "last_seen": "2000-01-01T00:00:00Z",
+            "resources": {"5": {"created_by_us": False}},
+        }
+        app.state[ip_fresh] = {
+            "last_seen": app.now_utc_iso(),
+            "resources": {"5": {"created_by_us": True}},
+        }
+
+    calls = []
+
+    def fake_delete(ip, rid):
+        calls.append((ip, rid))
+        # Only succeed for ip_removed; fail for ip_delete_failed
+        return ip == ip_removed
+
+    # Avoid any external effects
+    monkeypatch.setattr(app, "delete_ip_rule_if_created_by_us", fake_delete)
+    monkeypatch.setattr(app, "expire_ip_from_targets", lambda _ip: None)
+
+    app.cleanup_old_ips()
+
+    with app.state_lock:
+        # Removed because deletion returned True and no resources remain
+        assert ip_removed not in app.state
+
+        # Deletion failed -> resource still present -> IP remains
+        assert ip_delete_failed in app.state
+        assert "5" in app.state[ip_delete_failed]["resources"]
+
+        # Not created by us -> never attempted -> remains
+        assert ip_not_created in app.state
+        assert "5" in app.state[ip_not_created]["resources"]
+
+        # Fresh (not expired) -> remains untouched
+        assert ip_fresh in app.state
+
+    # Verify delete was attempted only for created_by_us expired IPs
+    ips_called = {ip for (ip, _rid) in calls}
+    assert ip_removed in ips_called
+    assert ip_delete_failed in ips_called
+    assert ip_not_created not in ips_called
+    assert ip_fresh not in ips_called
+
+
+
+def test_cleanup_does_not_remove_non_created_rules(monkeypatch, app_module):
+    """Ensure that Pangolin rules not created by us are not removed during cleanup."""
+    import pytest
+
+    app = app_module
+
+    # Force expiration
+    monkeypatch.setattr(app, "RETENTION_MINUTES", 0)
+
+    ip = "7.7.7.7"
+    with app.state_lock:
+        app.state[ip] = {
+            "last_seen": "2000-01-01T00:00:00Z",
+            "resources": {"5": {"created_by_us": False}},
+        }
+
+    called = []
+
+    def delete_should_not_be_called(ip_arg, rid):
+        called.append((ip_arg, rid))
+        pytest.fail("delete_ip_rule_if_created_by_us must not be called for non-created rules")
+
+    monkeypatch.setattr(app, "delete_ip_rule_if_created_by_us", delete_should_not_be_called)
+    monkeypatch.setattr(app, "expire_ip_from_targets", lambda _ip: None)
+
+    app.cleanup_old_ips()
+
+    with app.state_lock:
+        assert ip in app.state
+        assert "5" in app.state[ip]["resources"]
+
+    # Ensure no delete attempt was made
+    assert called == []
