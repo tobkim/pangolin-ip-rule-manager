@@ -154,7 +154,6 @@ def _crowdsec_refresh_allowlist_ip_set() -> set[str]:
     """Force refresh the cache by running 'cscli allowlist <name> list' or variants."""
     if not CROWDSEC_ENABLED:
         return set()
-    # try variants (prefer JSON)
     ip_set: set[str] = set()
 
     args = ["allowlist", "inspect", CROWDSEC_ALLOWLIST_NAME, "-o", "json"]

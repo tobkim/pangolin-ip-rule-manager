@@ -251,9 +251,7 @@ def delete_ip_rule_if_created_by_us(ip: str, rid: int) -> bool:
 
 def cleanup_old_ips():
     print("[cleanup] starting")
-    # Avoid dumping the entire state (privacy/noise); log a summary count instead
 
-    # Use second-level precision to align with stored timestamps (now_utc_iso has no microseconds)
     now_sec = datetime.now(timezone.utc).replace(microsecond=0)
     cutoff = now_sec - timedelta(minutes=RETENTION_MINUTES)
     with state_lock:
