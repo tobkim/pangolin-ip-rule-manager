@@ -4,8 +4,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from http.server import HTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -40,6 +39,8 @@ CROWDSEC_CSCLI_BIN = os.getenv("CROWDSEC_CSCLI_BIN", "cscli").strip()
 CROWDSEC_CMD_PREFIX = os.getenv("CROWDSEC_CMD_PREFIX", "").strip()
 CROWDSEC_ALLOWLIST_NAME = os.getenv("CROWDSEC_ALLOWLIST_NAME", "pangolin-ip-rule-manager").strip()
 CROWDSEC_CACHE_TTL_SECONDS = int(os.getenv("CROWDSEC_CACHE_TTL_SECONDS", "3600"))  # cache TTL for CrowdSec allowlist entries (~1h)
+# Optional: allow overriding the caller IP via /update?ip=...
+UPDATE_ENDPOINT_ENABLED = os.getenv("UPDATE_ENDPOINT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 # Mandatory Pangolin custom header gate: both must be set and non-empty
 EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", "").strip()
 EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE = os.getenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", "").strip()
@@ -142,7 +143,7 @@ def http_json(method: str, url: str, body: dict | None = None) -> dict:
     except HTTPError as e:
         try:
             err = e.read().decode("utf-8", errors="replace")
-        except Exception:
+        except (UnicodeDecodeError, IOError):  # More specific exceptions
             err = str(e)
         raise RuntimeError(f"HTTP {e.code} {e.reason}: {err}")
     except URLError as e:
@@ -172,7 +173,7 @@ class PangolinTarget(Target):
         ctx = self._ctx_factory()
         pg_ensure_ip_rule(ctx, ip)
 
-    # Pangolin cleanup is handled separately based on created_by_us; no generic expire here.
+    # Pangolin cleanup is handled separately based on created_by_us; no expire here.
     def expire_ip(self, ip: str) -> None:
         return
 
@@ -263,12 +264,13 @@ def cleanup_old_ips():
             resources = rec.get("resources", {})
         try:
             last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")) if last_seen_str else None
-        except Exception:
+        except ValueError:  # Specifically catch ValueError for invalid datetime format
+            print(f"[cleanup] Invalid datetime format in last_seen: {last_seen_str}")
             last_seen = None
         # Skip if record is missing timestamp or not yet expired
         if not last_seen or last_seen >= cutoff:
             continue
-        # Time to cleanup per resource if created_by_us
+        # Time to clean up per resource if created_by_us
         changed = False
         for rid_str, meta in list(resources.items()):
             rid = int(rid_str)
@@ -314,6 +316,8 @@ def _make_image_handler_context() -> dict:
     return {
         "expected_header_key": EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY,
         "expected_header_value": EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE,
+        "update_enabled": UPDATE_ENDPOINT_ENABLED,
+        "retention_minutes": RETENTION_MINUTES,
         "state": state,
         "state_lock": state_lock,
         "now_utc_iso": now_utc_iso,
@@ -325,7 +329,7 @@ def _make_image_handler_context() -> dict:
     }
 
 
-# Expose the HTTP handler class (renamed from BannerHandler)
+# Expose the HTTP handler class
 ImageRequestHandler = create_image_request_handler(_make_image_handler_context())
 
 def self_check():
@@ -336,7 +340,8 @@ def self_check():
     if not EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE:
         missing.append("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE")
     if missing:
-        # Keep behavior aligned with import-time validation, but provide a clear error here as well
+        # Keep behavior aligned with import-time validation but provide a clear error here as well
+        print("[self-check] WARNING: Missing required environment variables: " + ", ".join(missing))
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(missing)
         )
@@ -355,7 +360,7 @@ def self_check():
         f"[self-check] OK. listen_port={LISTEN_PORT} state_file={STATE_FILE} "
         f"resources={RESOURCE_IDS} retention_minutes={RETENTION_MINUTES} "
         f"cleanup_interval_minutes={CLEANUP_INTERVAL_MINUTES} rule_priority={RULE_PRIORITY} "
-        f"crowdsec={cs_status}"
+        f"crowdsec={cs_status} update_endpoint_enabled={UPDATE_ENDPOINT_ENABLED}"
     )
 
 

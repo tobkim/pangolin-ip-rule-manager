@@ -347,3 +347,130 @@ def test_cleanup_does_not_remove_non_created_rules(monkeypatch, app_module):
 
     # Ensure no delete attempt was made
     assert called == []
+
+
+
+def _reload_app_with_env(monkeypatch, temp_state_file, update_enabled: bool):
+    # Helper to load app with standard env and update endpoint toggle
+    monkeypatch.setenv("PANGOLIN_TOKEN", "")
+    monkeypatch.setenv("RESOURCE_IDS", "9")
+    monkeypatch.setenv("LISTEN_PORT", "0")
+    monkeypatch.setenv("STATE_FILE", temp_state_file)
+    monkeypatch.setenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY", "X-Test-Key")
+    monkeypatch.setenv("EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE", "v123")
+    monkeypatch.setenv("UPDATE_ENDPOINT_ENABLED", "true" if update_enabled else "false")
+    import app as _app
+    return importlib.reload(_app)
+
+
+def test_update_endpoint_enabled_adds_arbitrary_ip(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+    with app.state_lock:
+        app.state.clear()
+
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", "/update?ip=1.2.3.4", headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        assert resp.status == 200
+        assert b'"ok":true' in data
+        assert b'"ip":"1.2.3.4"' in data
+
+    with app.state_lock:
+        assert "1.2.3.4" in app.state
+        assert "last_seen" in app.state["1.2.3.4"]
+
+
+def test_update_endpoint_disabled_returns_404(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=False)
+
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", "/update?ip=1.2.3.4", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 404
+
+
+def test_update_endpoint_missing_header_403(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/update?ip=1.2.3.4")
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 403
+
+
+def test_update_endpoint_missing_ip_param_400(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", "/update", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 400
+
+
+def test_update_endpoint_invalid_ip_400(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", "/update?ip=999.999.999.999", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 400
+
+
+def test_update_endpoint_ipv6_success(monkeypatch, temp_state_file):
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+
+    ipv6 = "2001:db8::1"
+    encoded = "2001%3Adb8%3A%3A1"
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", f"/update?ip={encoded}", headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        assert resp.status == 200
+        assert f'"ip":"{ipv6}"'.encode() in data
+    with app.state_lock:
+        assert ipv6 in app.state
+
+
+def test_update_endpoint_last_seen_updates(monkeypatch, temp_state_file):
+    import time as _time
+    app = _reload_app_with_env(monkeypatch, temp_state_file, update_enabled=True)
+
+    ip = "5.6.7.8"
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", f"/update?ip={ip}", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 200
+    with app.state_lock:
+        first_seen = app.state[ip]["last_seen"]
+        assert first_seen
+    # Wait at least 1 second to ensure timestamp changes (now_utc_iso resolution is 1s)
+    _time.sleep(1.1)
+    with start_server(app.ImageRequestHandler) as (_httpd, port):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {app.EXPECTED_PANGOLIN_CUSTOM_HEADER_KEY: app.EXPECTED_PANGOLIN_CUSTOM_HEADER_VALUE}
+        conn.request("GET", f"/update?ip={ip}", headers=headers)
+        resp = conn.getresponse()
+        _ = resp.read()
+        assert resp.status == 200
+    with app.state_lock:
+        second_seen = app.state[ip]["last_seen"]
+    assert second_seen != first_seen
