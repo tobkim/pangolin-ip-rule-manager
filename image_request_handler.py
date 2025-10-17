@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+import ipaddress
 
 
 def create_image_request_handler(ctx: dict):
@@ -57,6 +58,60 @@ def create_image_request_handler(ctx: dict):
                 return
 
             lower_path = path.lower()
+
+            # New: /update?ip=1.2.3.4 endpoint (guarded by UPDATE_ENDPOINT_ENABLED)
+            if lower_path == "/update":
+                if not ctx.get("update_enabled"):
+                    # Pretend it doesn't exist when disabled
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Not found")
+                    print(f"[error] Update endpoint disabled: {self.path}")
+                    return
+
+                qs = parse_qs(parsed_path.query or "")
+                raw_ip = (qs.get("ip", [""])[0] or "").strip()
+                if not raw_ip:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad Request: missing 'ip' query parameter")
+                    print(f"[error] Missing 'ip' query parameter: {self.path}")
+                    return
+                try:
+                    # Normalize and validate (supports IPv4 and IPv6)
+                    normalized_ip = str(ipaddress.ip_address(raw_ip))
+                except Exception:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Bad Request: invalid IP address")
+                    print(f"[error] Invalid IP address: {raw_ip}")
+                    return
+
+                # Update state and ensure rules for the provided IP using same retention behavior
+                with ctx["state_lock"]:
+                    rec = ctx["state"].setdefault(normalized_ip, {"last_seen": ctx["now_utc_iso"](), "resources": {}})
+                    rec["last_seen"] = ctx["now_utc_iso"]()
+                ctx["save_state"]()
+
+                # Perform target updates synchronously (simple, small scale)
+                try:
+                    ctx["add_ip_to_targets"](normalized_ip)
+                except Exception as e:
+                    print(f"[error] add_ip_to_targets failed for {normalized_ip}: {e}")
+
+                # Respond JSON summary
+                payload = (
+                    "{"
+                    f"\"ok\":true,\"ip\":\"{normalized_ip}\",\"retention_minutes\":{ctx.get('retention_minutes', 0)}"
+                    "}"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             # Explicitly forbid root path even if header is correct
             if path == "/":
                 self.send_response(403)
